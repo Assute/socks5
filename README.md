@@ -4,5 +4,5 @@
 # 安装脚本
 
 ```shell script
-bash <(curl -fsSL https://github.com/Assute/socks5/blob/main/install.sh)
+bash <(curl -fsSL https://github.com/Assute/socks5/raw/main/install.sh)
 ```
