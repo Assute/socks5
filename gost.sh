@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 管理脚本 v1.0   (gost v2 后端)
+#  SOCKS5 管理脚本 v1.1   (gost v2 后端)
 #
 #  系统: Debian / Ubuntu / CentOS / Rocky / Alma / RHEL (systemd)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc) · 状态 · 自检 · 升级
@@ -35,7 +35,7 @@ SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/gost.sh"
 SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main"
 
 GOST_VER="2.12.0"
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 BIG_RATE="10000mbit"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -723,6 +723,47 @@ test_proxy() {
 # ============================================================
 #  交互
 # ============================================================
+# 端口被占用时，说清楚是谁占的、怎么让开
+port_conflict_report() {
+    local p="$1" line
+    line=$(port_listeners "$p" | head -n1)
+    log_error "端口 $p 已被占用："
+    [[ -n "$line" ]] && printf '  %s\n' "$line"
+    case "$line" in
+        *danted*)
+            log_error "  占用者是 dante 版 SOCKS5（另一个脚本装的），先卸载它："
+            echo "    systemctl disable --now danted socks5-shaping 2>/dev/null"
+            echo "    pkill -9 -x danted"
+            echo "    ss -ltnp | grep -w $p      # 确认没输出"
+            echo "    systemctl reset-failed gost"
+            ;;
+        *gost*)
+            log_error "  是本脚本自己的服务在跑，重启即可，不必换端口"
+            ;;
+        *)
+            echo "  换一个端口，或先停掉占用它的服务"
+            ;;
+    esac
+}
+
+# 交互模式下如果占用者是 danted，直接问要不要停掉
+offer_free_port() {
+    local p="$1" line c
+    line=$(port_listeners "$p" | head -n1)
+    printf '%s' "$line" | grep -q danted || return 1
+    read -r -p "  占用者是 dante 服务，现在停掉它并继续？[y/N]: " c
+    [[ "${c,,}" != "y" ]] && return 1
+    systemctl disable --now danted >/dev/null 2>&1
+    systemctl disable --now socks5-shaping >/dev/null 2>&1
+    pkill -x danted >/dev/null 2>&1
+    sleep 1
+    pkill -9 -x danted >/dev/null 2>&1
+    sleep 1
+    port_in_use "$p" && return 1
+    log_success "已释放端口 $p"
+    return 0
+}
+
 ask_port() {
     local def="${1:-8443}" input
     while true; do
@@ -738,6 +779,9 @@ ask_port() {
             fi
             log_error "端口 $input 已被占用"
             port_listeners "$input" | head -n1
+            if offer_free_port "$input"; then
+                PORT="$input"; return 0
+            fi
             continue
         fi
         PORT="$input"; return 0
@@ -1393,6 +1437,17 @@ do_install_cli() {
 
     PORT="${wp:-8443}"
     [[ "$PORT" =~ ^[0-9]+$ ]] && [[ "$PORT" -ge 1 && "$PORT" -le 65535 ]] || die "端口非法: $PORT"
+
+    # 非交互模式没法询问，端口被占就直接中止，且不在磁盘上留下半成品
+    if port_in_use "$PORT"; then
+        if port_listeners "$PORT" | grep -q gost; then
+            log_warn "端口 $PORT 由现有的 gost 服务占用，将继续并重启它"
+        else
+            echo
+            port_conflict_report "$PORT"
+            die "端口 $PORT 被占用，安装中止（未做任何改动）"
+        fi
+    fi
     if [[ "$noauth" == "1" ]]; then
         USE_AUTH=false; USER_NAME=""; PASS_WORD=""
     else
