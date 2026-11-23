@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 服务管理脚本 v3.5   (Dante SOCKS5)
+#  SOCKS5 服务管理脚本 v3.6   (Dante SOCKS5)
 #
 #  系统: Debian / Ubuntu (apt)   CentOS / Rocky / Alma / RHEL (dnf|yum)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc HTB) · 状态 · 日志 · 统计
@@ -26,7 +26,7 @@ SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/install.sh?ref
 LOG_FILE="/var/log/danted.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-danted"
 IFB_DEV="ifb0"
-SCRIPT_VERSION="3.5"
+SCRIPT_VERSION="3.6"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'
@@ -401,17 +401,15 @@ install_self() {
     fi
 
     if [[ -z "$got" ]]; then
-        local tmp=""
+        local tmp="" dv=""
         tmp=$(mktemp /tmp/socks5.XXXXXX 2>/dev/null) || return 0
-        if has_cmd curl && curl -fsSL -o "$tmp" "$SELF_URL" 2>/dev/null \
-            && head -n1 "$tmp" 2>/dev/null | grep -q '^#!.*bash' \
-            && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null; then
-            # raw.githubusercontent 有 CDN 缓存，刚推送后可能还拿不到新版。
-            # 版本不一致必须说出来，否则会把旧版悄悄装成常驻命令。
-            local dv
-            dv=$(sed -n 's/^SCRIPT_VERSION="\(.*\)"/\1/p' "$tmp" 2>/dev/null | head -n1)
+        # 走 fetch_latest（API 优先），不要直接用 SELF_URL：
+        # raw.githubusercontent 的缓存可能滞后很久，某些网络环境下
+        # 甚至会一直返回旧内容，直接拿它装会把旧版固化成常驻命令。
+        if fetch_latest "$tmp"; then
+            dv=$(ver_of "$tmp")
             if [[ -n "$dv" && "$dv" != "$SCRIPT_VERSION" ]]; then
-                log_warn "下载到的副本是 v$dv，当前运行的是 v$SCRIPT_VERSION（CDN 缓存滞后）"
+                log_warn "下载到的是 v$dv，当前运行 v$SCRIPT_VERSION（缓存滞后，稍后用 socks5 upgrade 再拉一次）"
             fi
             install -m 0755 "$tmp" "$SELF_PATH" 2>/dev/null && got="download"
         fi
