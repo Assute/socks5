@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 服务管理脚本 v3.1   (Dante SOCKS5)
+#  SOCKS5 服务管理脚本 v3.2   (Dante SOCKS5)
 #
 #  系统: Debian / Ubuntu (apt)   CentOS / Rocky / Alma / RHEL (dnf|yum)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc HTB) · 状态 · 日志 · 统计
@@ -23,7 +23,7 @@ SELF_PATH="/usr/local/sbin/socks5"
 LOG_FILE="/var/log/danted.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-danted"
 IFB_DEV="ifb0"
-SCRIPT_VERSION="3.1"
+SCRIPT_VERSION="3.2"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'
@@ -113,13 +113,25 @@ count_in() {
     printf '%s' "${n:-0}"
 }
 
+# 输出占用指定端口的监听行（含进程信息）
+# 注意：ss 加 -p 后行尾是 users:(("danted",pid=...))，
+# 所以必须按第 4 列（本地地址）匹配，不能拿 $ 锚在整行末尾
+port_listeners() {
+    local p="$1"
+    if has_cmd ss; then
+        ss -H -ltnp 2>/dev/null | awk -v w=":$p" '$4 ~ (w "$")'
+    elif has_cmd netstat; then
+        netstat -ltnp 2>/dev/null | awk -v w=":$p" '$4 ~ (w "$")'
+    fi
+}
+
 # 端口是否在监听
 port_listening() {
     local p="$1"
     if has_cmd ss; then
-        ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+        ss -H -ltn 2>/dev/null | awk -v w=":$p" '$4 ~ (w "$")' | grep -q .
     elif has_cmd netstat; then
-        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+        netstat -ltn 2>/dev/null | awk -v w=":$p" '$4 ~ (w "$")' | grep -q .
     else
         return 1
     fi
@@ -129,9 +141,9 @@ port_in_use() {
     local p="$1"
     # ss/netstat 输出列: State Recv-Q Send-Q Local-Addr:Port Peer-Addr:Port → 本地地址是第 4 列
     if has_cmd ss; then
-        ss -H -ltnu 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+        ss -H -ltnu 2>/dev/null | awk -v w=":$p" '$4 ~ (w "$")' | grep -q .
     elif has_cmd netstat; then
-        netstat -ltnu 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+        netstat -ltnu 2>/dev/null | awk -v w=":$p" '$4 ~ (w "$")' | grep -q .
     else
         return 1
     fi
@@ -493,9 +505,7 @@ clientmethod: none
 user.privileged: root
 user.unprivileged: nobody
 
-# 超时
-connecttimeout: 30
-iotimeout: 86400
+# 超时沿用 dante 默认值：连接 30 秒，空闲不超时
 
 # 客户端接入规则
 client pass {
@@ -514,6 +524,10 @@ EOF
 }
 
 write_systemd_unit() {
+    # 关键：danted 不加 -D 时在前台运行、不 fork。
+    # 所以必须用 Type=simple 直接托管前台进程；
+    # 用 Type=forking 会等一个永远不出现的父进程退出（90 秒超时后强杀）。
+    # 同理不要写 PIDFile：pid 文件只有传 -p 才会生成。
     cat >"$S5_UNIT" <<EOF
 [Unit]
 Description=Dante SOCKS5 Server
@@ -522,12 +536,14 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=forking
-PIDFile=/run/danted.pid
-GuessMainPID=yes
+Type=simple
 ExecStart=$DANTE_BIN -f $DANTE_CONF
 ExecReload=/bin/kill -HUP \$MAINPID
-KillMode=process
+# danted 会派生多个子进程（mother/negotiate/request/io），
+# 必须让 systemd 管住整个 cgroup，否则停止后子进程继续占着端口
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
@@ -536,7 +552,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    log_info "systemd 单元已写入"
+    log_info "systemd 单元已写入（Type=simple）"
 }
 
 write_logrotate() {
@@ -653,7 +669,7 @@ ask_port() {
                 SOCKS_PORT="$input"; return 0
             fi
             log_error "端口 $input 已被占用"
-            has_cmd ss && ss -ltnp 2>/dev/null | grep -E "[:.]${input}\$" | head -n1
+            port_listeners "$input" | head -n1
             continue
         fi
         SOCKS_PORT="$input"
@@ -801,13 +817,14 @@ do_install() {
     write_danted_conf
 
     log_step "校验 Dante 配置"
-    if ! "$DANTE_BIN" -v -f "$DANTE_CONF" >/tmp/danted_verify.$$ 2>&1; then
-        log_error "配置校验失败："
-        cat /tmp/danted_verify.$$
-        rm -f /tmp/danted_verify.$$
+    # 注意：-V 才是"校验配置并退出"，-v 是"打印版本号"（永远返回 0）
+    local vlog
+    if ! vlog=$("$DANTE_BIN" -V -f "$DANTE_CONF" 2>&1); then
+        log_error "配置校验失败，danted 输出："
+        printf '%s\n' "$vlog"
         return 1
     fi
-    rm -f /tmp/danted_verify.$$
+    [[ -n "$vlog" ]] && printf '%s\n' "$vlog"
     log_success "配置校验通过"
 
     write_systemd_unit
@@ -822,14 +839,11 @@ do_install() {
     save_install_info
 
     log_step "启动服务"
+    stop_dante_clean
     systemctl enable danted >/dev/null 2>&1
-    systemctl stop danted >/dev/null 2>&1
-    systemctl start danted
-    sleep 2
 
-    if ! dante_running; then
-        log_error "服务启动失败，最近日志："
-        journalctl -u danted --no-pager -n 25 2>/dev/null
+    if ! start_dante; then
+        dump_dante_failure
         return 1
     fi
 
@@ -1000,19 +1014,73 @@ write_danted_conf_with() {
     SOCKS_PORT="$old"
 }
 
+# 彻底停掉 danted
+# dante 会派生一组子进程；历史上用 KillMode=process 时停不干净，
+# 残留进程继续占着监听端口，下一次启动必然失败。
+stop_dante_clean() {
+    systemctl stop danted >/dev/null 2>&1
+    systemctl reset-failed danted >/dev/null 2>&1
+    if has_cmd pgrep && pgrep -x danted >/dev/null 2>&1; then
+        log_warn "清理残留 danted 进程"
+        has_cmd pkill && pkill -x danted >/dev/null 2>&1
+        sleep 1
+        if pgrep -x danted >/dev/null 2>&1; then
+            has_cmd pkill && pkill -9 -x danted >/dev/null 2>&1
+            sleep 1
+        fi
+    fi
+    rm -f /run/danted.pid 2>/dev/null
+    return 0
+}
+
+start_dante() {
+    local rc=0
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl start danted || rc=$?
+    sleep 2
+    if [[ $rc -eq 0 ]] && dante_running && port_listening "$SOCKS_PORT"; then
+        return 0
+    fi
+    return 1
+}
+
+# 启动失败时把真正有用的信息一次打完，别让人再手工去翻 journal
+dump_dante_failure() {
+    log_error "服务启动失败，诊断信息："
+    hr
+    log_error "1) danted 配置校验（-V）："
+    "$DANTE_BIN" -V -f "$DANTE_CONF" 2>&1 | head -n 20
+    hr
+    log_error "2) systemd 状态："
+    systemctl status danted --no-pager -l 2>/dev/null | head -n 15
+    hr
+    log_error "3) 最近日志："
+    journalctl -xeu danted --no-pager -n 20 2>/dev/null
+    hr
+    log_error "4) 端口占用（残留进程会导致 Address already in use）："
+    local busy
+    busy=$(port_listeners "$SOCKS_PORT")
+    if [[ -n "$busy" ]]; then
+        printf '%s\n' "$busy"
+    else
+        echo "  端口 ${SOCKS_PORT} 当前无人监听"
+    fi
+    log_error "5) danted 进程："
+    pgrep -ax danted 2>/dev/null | head -n 10 || echo "  无残留进程"
+    hr
+    log_error "清理后重试： systemctl stop danted; pkill -9 -x danted; socks5 restart"
+}
+
 restart_dante() {
     log_info "重启 danted..."
-    systemctl restart danted
-    sleep 2
-    if dante_running && port_listening "$SOCKS_PORT"; then
-        log_success "服务运行中，端口 $SOCKS_PORT 监听正常"
-    else
-        log_error "服务异常"
-        systemctl status danted --no-pager -l 2>/dev/null | head -n 20
-        journalctl -u danted --no-pager -n 20 2>/dev/null
+    stop_dante_clean
+    if ! start_dante; then
+        dump_dante_failure
         return 1
     fi
+    log_success "服务运行中，端口 $SOCKS_PORT 监听正常"
     log_usage "service restarted"
+    return 0
 }
 
 # ============================================================
@@ -1032,8 +1100,8 @@ do_uninstall() {
 
     log_step "停止服务"
     systemctl disable --now socks5-shaping >/dev/null 2>&1
-    systemctl disable --now danted >/dev/null 2>&1
-    systemctl stop danted >/dev/null 2>&1
+    systemctl disable danted >/dev/null 2>&1
+    stop_dante_clean
 
     log_step "清理限速规则"
     shaping_clear "$(resolve_iface)"
@@ -1268,7 +1336,7 @@ show_status() {
     echo -e "${CYAN}当前连接数${NC}"
     if has_cmd ss; then
         local n
-        n=$(ss -Htn state established 2>/dev/null | awk -v p=":$SOCKS_PORT" '$4 ~ p || $5 ~ p' | wc -l)
+        n=$(ss -Htn state established 2>/dev/null | awk -v w=":$SOCKS_PORT" '$4 ~ (w "$")' | wc -l)
         echo "  SOCKS 端口已建立连接: $n"
     fi
     log_usage "status checked"
@@ -1455,7 +1523,7 @@ do_install_noninteractive() {
     fi
     create_system_user || die "认证用户创建失败"
     write_danted_conf
-    "$DANTE_BIN" -v -f "$DANTE_CONF" >/dev/null 2>&1 || die "配置校验失败"
+    "$DANTE_BIN" -V -f "$DANTE_CONF" >/dev/null 2>&1 || die "配置校验失败（$DANTE_BIN -V -f $DANTE_CONF 可看详情）"
     write_systemd_unit
     write_logrotate
     open_port "$SOCKS_PORT"
@@ -1463,9 +1531,11 @@ do_install_noninteractive() {
     write_shaping_unit
     save_install_info
     systemctl enable danted >/dev/null 2>&1
-    systemctl restart danted
-    sleep 2
-    dante_running || die "服务启动失败，查看: journalctl -u danted -n 30"
+    stop_dante_clean
+    if ! start_dante; then
+        dump_dante_failure
+        exit 1
+    fi
     test_proxy
     show_install_complete
     log_usage "installed port=$SOCKS_PORT auth=$USE_AUTH (cli)"

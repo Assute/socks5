@@ -115,12 +115,31 @@ curl --socks5-hostname 服务器IP:1080 --proxy-user '用户名:密码' https://
 systemctl status danted            # 服务状态
 journalctl -u danted -n 50         # 启动报错
 tail -f /var/log/danted.log        # 连接日志
-danted -v -f /etc/danted.conf      # 配置校验
+danted -V -f /etc/danted.conf      # 配置校验（大写 V；小写 v 只打印版本号）
 tc -s class show dev eth0          # 限速是否命中（看 Sent 字节数）
 iptables -S INPUT | grep 1080      # 防火墙规则
 ```
 
 改完 `danted.conf` 记得 `systemctl restart danted`。
+
+### 启动超时 / 起不来
+
+dante 的几个行为容易踩：不给 `-D` 时它在前台运行、不 fork；pid 文件要 `-p` 显式指定才会生成。所以 unit 必须用 `Type=simple` 托管前台进程，写 `Type=forking` + `PIDFile=` 会卡满 90 秒然后被杀。脚本生成的 unit 已经是正确的，如果手工改过，对照检查：
+
+```bash
+systemctl cat danted | grep -E 'Type=|PIDFile|KillMode'
+# 期望：Type=simple，没有 PIDFile，KillMode=mixed
+```
+
+danted 会派生一组子进程，残留下来会占着端口导致下次启动 `Address already in use`：
+
+```bash
+systemctl stop danted; systemctl reset-failed danted
+pkill -9 -x danted
+rm -f /run/danted.pid
+ss -ltnp | grep 1080        # 确认端口已释放
+socks5 restart
+```
 
 ## 安全
 
