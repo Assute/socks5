@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 服务管理脚本 v3.7   (Dante SOCKS5)
+#  SOCKS5 服务管理脚本 v3.8   (Dante SOCKS5)
 #
 #  系统: Debian / Ubuntu (apt)   CentOS / Rocky / Alma / RHEL (dnf|yum)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc HTB) · 状态 · 日志 · 统计
@@ -26,7 +26,7 @@ SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/install.sh?ref
 LOG_FILE="/var/log/danted.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-danted"
 IFB_DEV="ifb0"
-SCRIPT_VERSION="3.7"
+SCRIPT_VERSION="3.8"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'
@@ -765,6 +765,8 @@ Description=Dante SOCKS5 Server
 Documentation=man:danted(8)
 After=network-online.target
 Wants=network-online.target
+# 进程如果被外部杀掉，不要因为"重启太频繁"而彻底放弃
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -775,15 +777,19 @@ ExecReload=/bin/kill -HUP \$MAINPID
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=15
-Restart=on-failure
+# always 而不是 on-failure：进程被 SIGKILL（云安全agent/OOM）时
+# ExitCode 可能仍为 0，on-failure 不会重启，服务就永久躺着
+Restart=always
 RestartSec=3
-LimitNOFILE=1048576
+# 用 65535 而不是 1048576：超过内核 fs.nr_open 时 systemd 只能钳位，
+# 某些内核上会连带启动失败，代理服务这个量级 65535 足够
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    log_info "systemd 单元已写入（Type=simple）"
+    log_info "systemd 单元已写入（Type=simple, Restart=always）"
 }
 
 write_logrotate() {
@@ -988,6 +994,18 @@ detect_iface() {
     log_info "出口网卡: $INTERFACE"
 }
 
+# 只测 TCP 能不能建立，不做协议握手。用于判断「外部能否连到这个端口」
+# —— 安全组/上游防火墙拦截的特征就是：本机通，公网不通
+tcp_probe() {
+    local h="$1" p="$2"
+    [[ -z "$h" || -z "$p" ]] && return 1
+    if has_cmd timeout; then
+        timeout 6 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null
+    else
+        (exec 3<>/dev/tcp/"$h"/"$p") 2>/dev/null
+    fi
+}
+
 test_proxy() {
     local rc=0
     port_listening "$SOCKS_PORT" || { log_error "端口 $SOCKS_PORT 未监听"; return 1; }
@@ -1008,11 +1026,25 @@ test_proxy() {
     fi
 
     case $rc in
-        0) log_success "代理连通性测试通过" ;;
+        0) log_success "本机经代理出网正常" ;;
         5|6) log_error "代理握手/认证失败（rc=$rc），检查用户名密码与 PAM" ;;
-        7)  log_warn "本地连接不上端口（rc=7），检查 danted 状态" ;;
-        *)  log_warn "连通性测试未通过（rc=$rc），可能是出口网络受限" ;;
+        7)  log_error "本机连不上端口（rc=7），danted 没在监听或已崩" ;;
+        28) log_error "代理出网超时（rc=28）：本机能进代理，但代理连不上目标" ;;
+        *)  log_warn "本机经代理出网未通过（rc=$rc）" ;;
     esac
+
+    # 关键的第二跳：从公网 IP 再连一次这个端口。
+    # 只测 127.0.0.1 无法发现云安全组/上游防火墙拦截。
+    if [[ -n "$SERVER_IP" && "$SERVER_IP" != "0.0.0.0" && "$SERVER_IP" != "127.0.0.1" ]]; then
+        if tcp_probe "$SERVER_IP" "$SOCKS_PORT"; then
+            log_success "公网 ${SERVER_IP}:${SOCKS_PORT} 可建立 TCP 连接"
+        else
+            log_error "公网 ${SERVER_IP}:${SOCKS_PORT} 连不上"
+            echo -e "  ${YELLOW}本机通、公网不通 = 云安全组或上游防火墙拦了，脚本管不到这一段${NC}"
+            echo "  控制台放行: 入方向 TCP ${SOCKS_PORT}"
+            echo "  阿里云/腾讯云/华为云 → 安全组；其他 → 服务商面板防火墙"
+        fi
+    fi
     return 0
 }
 
@@ -1838,6 +1870,25 @@ do_doctor() {
                 echo -e "  单元格式: ${YELLOW}旧格式，跑 socks5 refresh 修正${NC}"
             fi
         fi
+        # 存活时长与重启次数是"能用几秒就断"这类问题的第一手证据：
+        # 时长只有几秒 + 重启次数很大 = 进程在反复死
+        local since nr up
+        since=$(systemctl show danted -p ActiveEnterTimestamp --value 2>/dev/null)
+        nr=$(systemctl show danted -p NRestarts --value 2>/dev/null)
+        if [[ -n "$since" ]]; then
+            up=$(date -d "$since" +%s 2>/dev/null)
+            if [[ -n "$up" ]]; then
+                echo "  启动于:   $since （已运行 $(( $(date +%s) - up )) 秒）"
+            else
+                echo "  启动于:   $since"
+            fi
+        fi
+        echo "  重启次数: ${nr:-0}"
+        if [[ -n "$nr" && "$nr" =~ ^[0-9]+$ && "$nr" -gt 2 ]]; then
+            echo -e "  ${YELLOW}重启次数偏多 → 进程在反复退出，看下面日志${NC}"
+        fi
+        echo "  最近日志:"
+        journalctl -u danted --no-pager -n 8 2>/dev/null | sed 's/^/    /'
     else
         echo -e "  danted:   $na 未安装"
     fi
@@ -1866,10 +1917,24 @@ do_doctor() {
 
     echo
     echo -e "${CYAN}[端口与限速]${NC}"
+    local dport=""
     if load_install_info; then
-        echo "  SOCKS 端口: $SOCKS_PORT"
-        if port_listening "$SOCKS_PORT"; then
+        dport="$SOCKS_PORT"
+        echo "  SOCKS 端口: $dport"
+        if port_listening "$dport"; then
             echo -e "  监听状态: $ok"
+            # 绑在哪个地址上很关键：只听 127.0.0.1 的话外部必然连不上
+            local binds
+            if has_cmd ss; then
+                binds=$(ss -H -ltn 2>/dev/null | awk -v w=":$dport" '$4 ~ (w "$") {print $4}' | sort -u | tr '\n' ' ')
+            fi
+            echo "  绑定地址: ${binds:-未知}"
+            case "$binds" in
+                *"0.0.0.0:$dport"*|*"[::]:$dport"*|*"*:$dport"*) ;;
+                "") ;;
+                *"127.0.0.1:$dport"*|*"[::1]:$dport"*)
+                    echo -e "  ${RED}只监听回环，外部永远连不上${NC}" ;;
+            esac
         else
             echo -e "  监听状态: $bad 未监听"
         fi
@@ -1877,6 +1942,51 @@ do_doctor() {
         echo -e "  安装信息: $na 缺失"
     fi
     echo "  限速: $(limit_status_text)"
+
+    echo
+    echo -e "${CYAN}[外部可达性]${NC}"
+    if [[ -n "$dport" ]]; then
+        if tcp_probe 127.0.0.1 "$dport"; then
+            echo -e "  本机 127.0.0.1:$dport  $ok"
+        else
+            echo -e "  本机 127.0.0.1:$dport  $bad"
+        fi
+        if [[ -n "$SERVER_IP" && "$SERVER_IP" != "0.0.0.0" ]]; then
+            if tcp_probe "$SERVER_IP" "$dport"; then
+                echo -e "  公网 $SERVER_IP:$dport  $ok"
+            else
+                echo -e "  公网 $SERVER_IP:$dport  $bad"
+                echo -e "  ${YELLOW}本机通公网不通 → 云安全组/上游防火墙，去控制台放行入方向 TCP $dport${NC}"
+            fi
+        fi
+    fi
+
+    echo
+    echo -e "${CYAN}[防火墙]${NC}"
+    local fw_any=0
+    if has_cmd ufw; then
+        fw_any=1
+        echo "  ufw: $(ufw status 2>/dev/null | head -n1 | sed 's/^Status: //')"
+        ufw status 2>/dev/null | grep -E "^${dport}(/tcp)?" | head -n2 | sed 's/^/    /'
+    fi
+    if has_cmd firewall-cmd; then
+        fw_any=1
+        local fs
+        fs=$(firewall-cmd --state 2>/dev/null)
+        echo "  firewalld: ${fs:-未运行}"
+        if [[ "$fs" == "running" ]]; then
+            echo "    已放行端口: $(firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -E "^${dport}/" | tr '\n' ' ')"
+        fi
+    fi
+    if has_cmd iptables; then
+        fw_any=1
+        local icnt
+        icnt=$(iptables -S INPUT 2>/dev/null | grep -c -- "--dport ${dport}")
+        echo "  iptables INPUT 匹配 ${dport} 的规则: ${icnt:-0} 条"
+    fi
+    [[ $fw_any -eq 0 ]] && echo -e "  $na 未检测到防火墙工具"
+    echo -e "  ${YELLOW}提示: 操作系统内的防火墙放行 ≠ 云安全组放行，两者都要开${NC}"
+
     hr
     return 0
 }
