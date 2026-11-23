@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 管理脚本 v1.2   (gost v2 后端)
+#  SOCKS5 管理脚本 v1.3   (gost v2 后端)
 #
 #  系统: Debian / Ubuntu / CentOS / Rocky / Alma / RHEL (systemd)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc) · 状态 · 自检 · 升级
@@ -16,6 +16,7 @@
 CONFIG_DIR="/etc/socks5-gost"
 INSTALL_INFO="$CONFIG_DIR/install.conf"
 LIMIT_CONF="$CONFIG_DIR/limit.conf"
+ALLOW_FILE="$CONFIG_DIR/allow.txt"
 STATS_FILE="$CONFIG_DIR/usage.log"
 
 GOST_BIN="/usr/local/bin/gost"
@@ -35,7 +36,7 @@ SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/gost.sh"
 SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main"
 
 GOST_VER="2.12.0"
-SCRIPT_VERSION="1.2"
+SCRIPT_VERSION="1.3"
 BIG_RATE="10000mbit"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -196,6 +197,192 @@ urlenc() {
         esac
     done
     printf '%s' "$out"
+}
+
+# ============================================================
+#  目标白名单
+#
+#  gost 的 bypass 能按目标地址过滤，实测（v2.12.0）得出三个要点：
+#    1) 内联值加 ~ 前缀才是白名单：bypass=~.example.com
+#    2) 值若为文件路径，~ 会被忽略 —— 文件里必须写 reverse true
+#    3) .example.com 匹配主域与一级子域；*.example.com 只匹配一级子域，
+#       不匹配主域。所以 *.x 统一归一成 .x，多覆盖主域本身。
+#       实测不支持二级以上（a.b.x.com 匹配不到）。
+# ============================================================
+allow_init() {
+    mkdir -p "$CONFIG_DIR" 2>/dev/null
+    chmod 700 "$CONFIG_DIR" 2>/dev/null
+    [[ -f "$ALLOW_FILE" ]] && return 0
+    cat >"$ALLOW_FILE" <<'EOF'
+# ===== SOCKS5 目标白名单 =====
+# 只有下面列出的目标能被代理访问，其余一律拒绝。
+#
+# 语法：
+#   .example.com     匹配 example.com 及其一级子域（www.example.com）
+#   *.example.com    同上，脚本会自动改写成 .example.com
+#   1.2.3.4          单个 IP
+#   10.0.0.0/8       网段
+#
+# 限制：gost 不支持二级以上子域，a.b.example.com 这种方式匹配不到。
+#
+# 下面两行是白名单开关，不要删：
+reload 10s
+reverse true
+EOF
+    chmod 600 "$ALLOW_FILE"
+}
+
+# 只输出规则行（去注释、空行和开关指令）
+allow_rules() {
+    [[ -f "$ALLOW_FILE" ]] || return 0
+    grep -vE '^[[:space:]]*(#|$)' "$ALLOW_FILE" 2>/dev/null \
+        | grep -vE '^[[:space:]]*(reload|reverse)([[:space:]]|$)' || true
+}
+
+allow_count() { allow_rules | grep -c . || true; }
+
+allow_enabled() { [[ "$(allow_count)" -gt 0 ]]; }
+
+allow_status_text() {
+    if allow_enabled; then
+        printf '已启用（%s 条规则）' "$(allow_count)"
+    else
+        printf '未启用（放行全部目标）'
+    fi
+}
+
+# 归一化：*.x → .x；去空白
+allow_normalize() {
+    local r
+    r=$(printf '%s' "$1" | tr -d ' \t\r\n')
+    [[ -z "$r" ]] && return 1
+    case "$r" in
+        \*.*) r=".${r#\*.}" ;;
+    esac
+    printf '%s' "$r"
+}
+
+allow_add() {
+    allow_init
+    local raw norm
+    for raw in "$@"; do
+        norm=$(allow_normalize "$raw") || continue
+        if allow_rules | grep -qxF -- "$norm"; then
+            log_info "已存在: $norm"
+            continue
+        fi
+        printf '%s\n' "$norm" >>"$ALLOW_FILE"
+        log_success "已添加: $norm"
+    done
+}
+
+allow_remove() {
+    allow_init
+    local norm tmp
+    norm=$(allow_normalize "$1") || return 1
+    tmp=$(mktemp) || return 1
+    grep -vxF -- "$norm" "$ALLOW_FILE" >"$tmp" 2>/dev/null || true
+    cat "$tmp" >"$ALLOW_FILE"
+    rm -f "$tmp"
+    log_info "已删除: $norm"
+}
+
+# 清空规则但保留文件头与开关（= 关闭白名单，放行全部）
+allow_clear() {
+    allow_init
+    local tmp
+    tmp=$(mktemp) || return 1
+    awk '
+        /^[[:space:]]*#/ { print; next }
+        /^[[:space:]]*$/ { print; next }
+        /^[[:space:]]*(reload|reverse)([[:space:]]|$)/ { print; next }
+        { next }
+    ' "$ALLOW_FILE" >"$tmp"
+    cat "$tmp" >"$ALLOW_FILE"
+    rm -f "$tmp"
+    log_warn "白名单已清空，当前放行全部目标"
+}
+
+# 生成 node URL 上要追加的参数；未启用时输出空
+bypass_param() {
+    allow_enabled || return 0
+    printf '?bypass=%s' "$ALLOW_FILE"
+}
+
+allow_show() {
+    allow_init
+    echo
+    echo -e "${CYAN}目标白名单${NC}  ($ALLOW_FILE)"
+    hr
+    echo "  状态: $(allow_status_text)"
+    echo
+    if allow_enabled; then
+        local i=1 r
+        while IFS= read -r r; do
+            printf '  %2d) %s\n' "$i" "$r"
+            i=$((i + 1))
+        done < <(allow_rules)
+    else
+        echo "  （无规则，等于不限制目标）"
+    fi
+    hr
+    echo "  提示: *.x.com 会自动按 .x.com 处理（覆盖主域 + 一级子域）"
+    echo "        文件改动后 10 秒内自动生效（reload 10s）"
+}
+
+do_allow() {
+    allow_init
+    local ch v
+    while true; do
+        echo
+        echo -e "${BLUE}白名单管理${NC}  当前: $(allow_status_text)"
+        hr
+        echo "  1) 查看规则"
+        echo "  2) 添加域名 / IP"
+        echo "  3) 删除规则"
+        echo "  4) 清空（改回放行全部目标）"
+        echo "  5) 重新应用到服务"
+        echo "  0) 返回"
+        echo
+        read -r -p "请选择: " ch
+        case "$ch" in
+            1) allow_show ;;
+            2)
+                echo "  可一次填多个，用空格或逗号分隔；支持 *.example.com"
+                read -r -p "  域名: " v
+                v="${v//,/ }"
+                # shellcheck disable=SC2086
+                allow_add $v
+                apply_allow
+                ;;
+            3)
+                allow_show
+                read -r -p "  要删除的规则: " v
+                allow_remove "$v"
+                apply_allow
+                ;;
+            4)
+                read -r -p "  确认清空白名单？之后任何目标都能走代理 [y/N]: " v
+                [[ "${v,,}" != "y" ]] && { log_info "已取消"; continue; }
+                allow_clear
+                apply_allow
+                ;;
+            5) apply_allow ;;
+            0) return 0 ;;
+            *) log_error "无效选择" ;;
+        esac
+    done
+}
+
+# 把白名单写进 gost 配置并重启（bypass 是启动参数，改文件靠 reload 只对部分场景有效，
+# 参数本身变了必须重启才稳妥）
+apply_allow() {
+    write_gost_conf
+    if gost_running; then
+        restart_gost && log_success "已应用，白名单: $(allow_status_text)"
+    else
+        log_info "配置已更新，服务未运行，下次启动生效"
+    fi
 }
 
 # ---------- 配置读写 ----------
@@ -365,11 +552,14 @@ write_gost_conf() {
     else
         node="socks5://:${PORT}"
     fi
+    # 白名单以启动参数形式挂上去；未启用时 bypass_param 输出空
+    node="${node}$(bypass_param)"
 
     # 凭据只放这里，权限 600，不进 systemd 命令行
     printf '{"ServeNodes":["%s"]}\n' "$node" >"$GOST_CONF"
     chmod 600 "$GOST_CONF"
     log_info "配置已写入 $GOST_CONF（权限 600）"
+    log_info "目标白名单: $(allow_status_text)"
 }
 
 write_unit() {
@@ -1260,6 +1450,26 @@ do_doctor() {
     echo "  限速: $(limit_status_text)"
 
     echo
+    echo -e "${CYAN}[目标白名单]${NC}"
+    allow_init
+    if allow_enabled; then
+        echo -e "  状态:     $ok 已启用（$(allow_count) 条规则）"
+        local i=1 r
+        while IFS= read -r r; do
+            printf '    %2d) %s\n' "$i" "$r"
+            i=$((i + 1))
+            [[ $i -gt 12 ]] && { echo "    ...（更多见 $ALLOW_FILE）"; break; }
+        done < <(allow_rules)
+        echo "  配置文件: $ALLOW_FILE"
+        grep -q '^reverse' "$ALLOW_FILE" 2>/dev/null \
+            && echo -e "  reverse:  $ok （白名单语义；文件方式下 ~ 前缀会被忽略，必须靠这行）" \
+            || echo -e "  reverse:  $bad 缺少 reverse true，当前会被当成黑名单！"
+    else
+        echo -e "  状态:     ${YELLOW}未启用（放行任意目标）${NC}"
+        [[ -f "$ALLOW_FILE" ]] && echo "  配置文件: $ALLOW_FILE"
+    fi
+
+    echo
     echo -e "${CYAN}[滥用风险]${NC}"
     if load_install_info; then
         if [[ "$USE_AUTH" != true ]]; then
@@ -1389,11 +1599,13 @@ show_menu() {
     echo -e "  ${BOLD}SOCKS5 管理脚本 v${SCRIPT_VERSION}${NC}  (gost ${GOST_VER})"
     echo -e "  状态: ${state}"
     echo -e "  限速: $(limit_status_text)"
+    echo -e "  白名单: $(allow_status_text)"
     echo "=================================================="
     echo -e "  ${CYAN}1${NC}) 安装 SOCKS5"
     echo -e "  ${CYAN}2${NC}) 修改配置（端口 / 认证）"
     echo -e "  ${CYAN}3${NC}) 卸载"
     echo -e "  ${CYAN}4${NC}) 设置限速"
+    echo -e "  ${CYAN}w${NC}) 白名单（只放行指定域名）"
     echo "  ------------------------------"
     echo -e "  ${CYAN}5${NC}) 查看状态"
     echo -e "  ${CYAN}6${NC}) 查看连接信息"
@@ -1407,19 +1619,20 @@ show_menu() {
 handle_menu() {
     while true; do
         show_menu
-        read -r -p "请选择 [0-9]: " choice
+        read -r -p "请选择 [0-9/w]: " choice
         case "$choice" in
             1) do_install ;;
             2) do_modify ;;
             3) do_uninstall ;;
             4) do_limit ;;
+            w|W|allow) do_allow ;;
             5) show_status ;;
             6) show_info ;;
             7) load_install_info; restart_gost ;;
             8) show_logs ;;
             9) do_doctor ;;
             0) log_info "已退出"; log_usage "exit"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-9" ;;
+            *) log_error "无效选项，请输入 0-9 或 w" ;;
         esac
         echo
         read -r -p "按回车继续..." -r _
@@ -1433,7 +1646,7 @@ SOCKS5 管理脚本 v${SCRIPT_VERSION}（gost ${GOST_VER} 后端）
 用法: $0 [命令] [选项]
 
 命令:
-  install, -i          安装（非交互: --port N --user U --pass P --no-auth）
+  install, -i          安装（非交互: --port N --user U --pass P --allow 域名列表 --no-auth）
   modify, -m           修改配置
   uninstall, -u        卸载
   limit, -L            设置端口限速
@@ -1441,6 +1654,7 @@ SOCKS5 管理脚本 v${SCRIPT_VERSION}（gost ${GOST_VER} 后端）
   info                 连接信息
   restart, -r          重启服务
   logs, -l             实时日志
+  allow                白名单管理（只放行指定域名）
   doctor               自检
   stats                操作统计
   version              版本
@@ -1455,12 +1669,13 @@ EOF
 
 do_install_cli() {
     shift
-    local wp="" wu="" wpp="" noauth=0
+    local wp="" wu="" wpp="" noauth=0 wallow=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --port) wp="$2"; shift 2 ;;
             --user) wu="$2"; shift 2 ;;
             --pass) wpp="$2"; shift 2 ;;
+            --allow) wallow="$2"; shift 2 ;;
             --no-auth) noauth=1; shift ;;
             *) die "未知选项: $1" ;;
         esac
@@ -1497,6 +1712,15 @@ do_install_cli() {
         valid_password "$PASS_WORD" || die "密码太长（上限 128）或含控制字符"
         [[ -z "$wu" ]] && log_info "未指定 --user，已生成用户名: $USER_NAME"
         [[ -z "$wpp" ]] && log_info "未指定 --pass，已生成密码: $PASS_WORD"
+    fi
+
+    # 白名单：命令行给了就写入（逗号或空格分隔）
+    allow_init
+    if [[ -n "$wallow" ]]; then
+        wallow="${wallow//,/ }"
+        # shellcheck disable=SC2086
+        allow_add $wallow >/dev/null
+        log_info "白名单: $(allow_status_text)"
     fi
 
     [[ -x "$GOST_BIN" ]] || download_gost
@@ -1541,6 +1765,7 @@ main() {
         info|--info)               show_info ;;
         restart|--restart|-r)      load_install_info; restart_gost ;;
         logs|--logs|-l)            show_logs ;;
+        allow|--allow)             do_allow ;;
         doctor|--doctor)           do_doctor ;;
         stats|--stats)             show_stats ;;
         version|--version)         show_version ;;
