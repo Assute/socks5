@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 服务管理脚本 v3.4   (Dante SOCKS5)
+#  SOCKS5 服务管理脚本 v3.5   (Dante SOCKS5)
 #
 #  系统: Debian / Ubuntu (apt)   CentOS / Rocky / Alma / RHEL (dnf|yum)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc HTB) · 状态 · 日志 · 统计
@@ -21,10 +21,12 @@ S5_UNIT="/etc/systemd/system/danted.service"
 SHAPING_UNIT="/etc/systemd/system/socks5-shaping.service"
 SELF_PATH="/usr/local/sbin/socks5"
 SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/install.sh"
+# 升级检查优先走 API：raw.githubusercontent 走 Fastly 缓存，刚推完会拿到旧内容
+SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/install.sh?ref=main"
 LOG_FILE="/var/log/danted.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-danted"
 IFB_DEV="ifb0"
-SCRIPT_VERSION="3.4"
+SCRIPT_VERSION="3.5"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'
@@ -421,6 +423,179 @@ install_self() {
     else
         log_warn "未能安装 $SELF_PATH；下次可直接运行: bash <(curl -fsSL $SELF_URL)"
     fi
+    return 0
+}
+
+# ---------- 版本比较与升级 ----------
+# 从任意脚本文件里取 SCRIPT_VERSION
+ver_of() {
+    sed -n 's/^SCRIPT_VERSION="\(.*\)"/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+# $1 是否比 $2 新（只处理点分数字，够用）
+ver_newer() {
+    local a="${1#v}" b="${2#v}"
+    [[ -z "$a" || -z "$b" ]] && return 1
+    [[ "$a" == "$b" ]] && return 1
+    local IFS='.'
+    local -a A B
+    # shellcheck disable=SC2206
+    A=($a)
+    B=($b)
+    local i n x y
+    n=${#A[@]}
+    [[ ${#B[@]} -gt $n ]] && n=${#B[@]}
+    for ((i = 0; i < n; i++)); do
+        x="${A[i]:-0}"; y="${B[i]:-0}"
+        [[ "$x" =~ ^[0-9]+$ ]] || x=0
+        [[ "$y" =~ ^[0-9]+$ ]] || y=0
+        ((10#$x > 10#$y)) && return 0
+        ((10#$x < 10#$y)) && return 1
+    done
+    return 1
+}
+
+# 取最新脚本到 $1，并校验它确实是本项目的完整脚本
+fetch_latest() {
+    local out="$1"
+    has_cmd curl || { log_error "缺少 curl"; return 1; }
+
+    # 1) API raw：不受 Fastly 缓存影响，但匿名有频率限制
+    if curl -fsSL --max-time 25 -H 'Accept: application/vnd.github.raw' \
+        "$SELF_API_URL" -o "$out" 2>/dev/null && [[ -s "$out" ]]; then
+        :
+    # 2) 退回 raw（可能拿到缓存里的旧版，由调用方比对版本）
+    elif curl -fsSL --max-time 25 -H 'Cache-Control: no-cache' \
+        "$SELF_URL" -o "$out" 2>/dev/null && [[ -s "$out" ]]; then
+        :
+    else
+        return 1
+    fi
+
+    head -n1 "$out" 2>/dev/null | grep -q '^#!.*bash' || return 1
+    grep -q 'SCRIPT_VERSION=' "$out" 2>/dev/null || return 1
+    return 0
+}
+
+# 升级脚本本身；成功后用新脚本重建服务配置（旧进程里的函数可能是旧格式）
+do_upgrade() {
+    local force="${1:-}"
+    echo
+    log_step "检查更新"
+
+    local cur="$SCRIPT_VERSION" inst="" base="" tmp=""
+    # 基准取「已安装命令的版本」——那才是下次运行实际会用的东西。
+    # 同一进程里刚升级完 $SCRIPT_VERSION 不会变，只能靠文件判断。
+    [[ -f "$SELF_PATH" ]] && inst=$(ver_of "$SELF_PATH")
+    base="$cur"
+    ver_newer "$inst" "$cur" && base="$inst"
+
+    tmp=$(mktemp /tmp/socks5.up.XXXXXX 2>/dev/null) || { log_error "无法创建临时文件"; return 1; }
+
+    if ! fetch_latest "$tmp"; then
+        rm -f "$tmp"
+        log_error "拉取最新版本失败（网络不通或被墙），可手动替换："
+        echo "  curl -fsSL -H 'Accept: application/vnd.github.raw' '$SELF_API_URL' -o $SELF_PATH"
+        return 1
+    fi
+
+    local new c
+    new=$(ver_of "$tmp")
+    log_info "当前运行: v$cur"
+    [[ -n "$inst" && "$inst" != "$cur" ]] && log_warn "已安装命令是 v$inst，与正在运行的 v$cur 不一致"
+    log_info "远端版本: v$new（比较基准 v$base）"
+
+    if [[ "$new" == "$base" ]]; then
+        log_success "已是最新版本 v$base"
+        rm -f "$tmp"
+        return 0
+    fi
+
+    if ver_newer "$new" "$base"; then
+        [[ "$force" == "--force" ]] && c=y || {
+            echo -n "升级到 v$new？[y/N]: "
+            read -r c
+        }
+    else
+        log_warn "远端 v$new 不比 v$base 新（通常是 CDN 缓存滞后）"
+        [[ "$force" == "--force" ]] && c=y || {
+            echo -n "仍要覆盖安装 v$new？[y/N]: "
+            read -r c
+        }
+    fi
+    [[ "${c,,}" != "y" ]] && { rm -f "$tmp"; log_info "已取消"; return 0; }
+
+    if [[ -f "$SELF_PATH" ]]; then
+        cp -f "$SELF_PATH" "${SELF_PATH}.bak" 2>/dev/null && log_info "旧版已备份: ${SELF_PATH}.bak"
+    fi
+    mkdir -p "$(dirname "$SELF_PATH")" 2>/dev/null
+    if ! install -m 0755 "$tmp" "$SELF_PATH" 2>/dev/null; then
+        rm -f "$tmp"
+        log_error "写入 $SELF_PATH 失败"
+        return 1
+    fi
+    rm -f "$tmp"
+    log_success "脚本已升级: v$cur → v$new"
+    log_usage "upgrade $cur -> $new"
+
+    # 关键：换脚本不等于换配置。新版本的 danted.conf / systemd 单元生成逻辑
+    # 可能修过，必须让新脚本自己重写一遍，不能拿当前进程里的旧函数去写。
+    if [[ -f "$INSTALL_INFO" ]]; then
+        echo
+        echo -n "同时用新版本重建服务配置（danted.conf + systemd 单元）并重启？[Y/n]: "
+        read -r c
+        if [[ "${c,,}" != "n" ]]; then
+            exec bash "$SELF_PATH" refresh
+        fi
+    fi
+    echo
+    log_info "已装新版本，重新执行 socks5 即可使用"
+    return 0
+}
+
+# 按安装记录重建 danted.conf 与 systemd 单元，然后重启
+do_refresh() {
+    if ! load_install_info; then
+        log_error "没有安装记录（$INSTALL_INFO），无法重建配置；请执行安装"
+        return 1
+    fi
+    SOCKS_PORT="${SOCKS_PORT:-1080}"
+    INTERFACE="${INTERFACE:-$(resolve_iface)}"
+    SERVER_IP="${SERVER_IP:-$(get_public_ip)}"
+    [[ -x "$DANTE_BIN" ]] || DANTE_BIN=$(command -v danted 2>/dev/null || echo "$DANTE_BIN")
+
+    log_step "重建 danted.conf（脚本 v$SCRIPT_VERSION）"
+    write_danted_conf
+
+    log_step "校验配置"
+    local vlog
+    if ! vlog=$("$DANTE_BIN" -V -f "$DANTE_CONF" 2>&1); then
+        log_error "重建后的配置校验失败，已保留备份，未重启服务："
+        printf '%s\n' "$vlog"
+        return 1
+    fi
+
+    log_step "重建 systemd 单元"
+    write_systemd_unit
+
+    log_step "重启服务"
+    stop_dante_clean
+    systemctl enable danted >/dev/null 2>&1
+    if ! start_dante; then
+        dump_dante_failure
+        return 1
+    fi
+
+    if [[ -n "$LIMIT_DOWN$LIMIT_UP" ]]; then
+        write_shaping_helper
+        systemctl enable socks5-shaping >/dev/null 2>&1
+        systemctl restart socks5-shaping >/dev/null 2>&1
+        log_info "限速规则已重新应用: $(limit_status_text)"
+    fi
+
+    save_install_info
+    log_success "已按 v$SCRIPT_VERSION 重建配置并重启，端口 $SOCKS_PORT"
+    log_usage "refresh by v$SCRIPT_VERSION"
     return 0
 }
 
@@ -1460,6 +1635,7 @@ show_menu() {
     echo -e "  ${CYAN}7${NC}) 重启服务"
     echo -e "  ${CYAN}8${NC}) 实时日志"
     echo -e "  ${CYAN}9${NC}) 操作统计"
+    echo -e "  ${CYAN}u${NC}) 升级脚本"
     echo -e "  ${CYAN}0${NC}) 退出"
     echo
 }
@@ -1467,7 +1643,7 @@ show_menu() {
 handle_menu() {
     while true; do
         show_menu
-        read -r -p "请选择 [0-9]: " choice
+        read -r -p "请选择 [0-9/u]: " choice
         case "$choice" in
             1) do_install ;;
             2) do_modify ;;
@@ -1478,8 +1654,9 @@ handle_menu() {
             7) restart_dante ;;
             8) show_logs ;;
             9) show_stats ;;
+            u|U|upgrade) do_upgrade ;;
             0) log_info "已退出"; log_usage "exit"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-9" ;;
+            *) log_error "无效选项，请输入 0-9 或 u" ;;
         esac
         echo
         read -r -p "按回车继续..." -r _
@@ -1505,6 +1682,8 @@ SOCKS5 管理脚本 v${SCRIPT_VERSION}
   restart, -r            重启服务
   logs, -l               实时日志
   stats                  操作统计
+  upgrade, --upgrade     检查并升级脚本（拉取最新版）
+  refresh, --refresh     按安装记录重建 danted.conf 与 systemd 单元并重启
   version, --version     显示版本与运行位置（排查版本错配用）
   help, -h               本帮助
 
@@ -1615,6 +1794,8 @@ main() {
         restart|--restart|-r) load_install_info; restart_dante ;;
         logs|--logs|-l)      show_logs ;;
         stats|--stats)       show_stats ;;
+        upgrade|--upgrade)   do_upgrade "${2:-}" ;;
+        refresh|--refresh)   do_refresh ;;
         version|--version)   show_version ;;
         help|--help|-h)      show_help ;;
         *) log_error "未知命令: $1"; show_help; exit 1 ;;

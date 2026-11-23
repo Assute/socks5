@@ -29,10 +29,45 @@ socks5
 7) 重启服务
 8) 实时日志
 9) 操作统计
+u) 升级脚本
 0) 退出
 ```
 
-菜单顶部实时显示：服务运行状态、端口、当前限速值。
+菜单顶部实时显示：脚本版本、服务运行状态、端口、当前限速值。
+
+## 升级
+
+```bash
+socks5 upgrade
+```
+
+拉取最新脚本，比对版本，确认后覆盖 `/usr/local/sbin/socks5`，旧版留一份 `.bak`。
+
+**换脚本不等于换配置。** 新版可能改过 `danted.conf` 或 systemd 单元的生成逻辑，所以升级后会问你要不要重建一遍：
+
+```
+同时用新版本重建服务配置（danted.conf + systemd 单元）并重启？[Y/n]:
+```
+
+选是就会用新脚本重新生成配置、校验、重启。这一步是用**新脚本**执行的（`exec`），不是拿当前进程里的旧函数去写 —— 否则只会把旧格式再写一遍。
+
+也可以单独重建，不升级：
+
+```bash
+socks5 refresh
+```
+
+改动过脚本或怀疑配置和版本对不上时，跑这个即可。
+
+拉取走 GitHub API 而不是 `raw.githubusercontent.com`：后者走 Fastly 缓存，刚发布时通常还拿到旧内容。API 失败才退回 raw，并在版本倒退时明确告警。
+
+查版本：
+
+```bash
+socks5 version
+```
+
+会同时打印**正在运行的版本**、**已安装命令的版本**、**安装记录里的版本**，三者不一致一眼可见。
 
 ## 限速
 
@@ -63,6 +98,9 @@ socks5 install --no-auth                 # 无认证（慎用）
 socks5 modify                            # 改端口 / 改密码 / 换认证模式
 socks5 limit                             # 限速菜单
 socks5 status | info | restart | logs | stats
+socks5 upgrade                           # 检查并升级脚本
+socks5 refresh                           # 按安装记录重建配置并重启
+socks5 version                           # 查版本（含已安装命令的版本）
 socks5 uninstall
 ```
 
