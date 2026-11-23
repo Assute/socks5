@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 服务管理脚本 v3.2   (Dante SOCKS5)
+#  SOCKS5 服务管理脚本 v3.3   (Dante SOCKS5)
 #
 #  系统: Debian / Ubuntu (apt)   CentOS / Rocky / Alma / RHEL (dnf|yum)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc HTB) · 状态 · 日志 · 统计
@@ -20,10 +20,11 @@ DANTE_BIN="/usr/sbin/danted"
 S5_UNIT="/etc/systemd/system/danted.service"
 SHAPING_UNIT="/etc/systemd/system/socks5-shaping.service"
 SELF_PATH="/usr/local/sbin/socks5"
+SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/install.sh"
 LOG_FILE="/var/log/danted.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-danted"
 IFB_DEV="ifb0"
-SCRIPT_VERSION="3.2"
+SCRIPT_VERSION="3.3"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'
@@ -381,12 +382,37 @@ EOF
     systemctl daemon-reload
 }
 
-# 顺便把管理命令装到 PATH，方便后续敲 socks5
+# 把管理命令装到 PATH，方便后续敲 socks5
+# 注意：用 bash <(curl ...) 方式运行时 $0 是 /dev/fd/63 —— 那是个管道，
+# 不是普通文件。此时既不能 install 复制（bash 还在从它读，复制只能拿到半截），
+# 也不能靠 $0 判断版本，唯一可靠做法是重新拉一份完整脚本。
 install_self() {
-    [[ -f "$0" && -r "$0" ]] || return 0
-    [[ "$(readlink -f "$0" 2>/dev/null)" == "$(readlink -f "$SELF_PATH" 2>/dev/null)" ]] && return 0
-    if install -m 0755 "$0" "$SELF_PATH" 2>/dev/null; then
+    if [[ -f "$0" ]] && [[ "$(readlink -f "$0" 2>/dev/null)" == "$(readlink -f "$SELF_PATH" 2>/dev/null)" ]]; then
+        return 0
+    fi
+
+    local got=""
+
+    if [[ -f "$0" && -r "$0" ]]; then
+        mkdir -p "$(dirname "$SELF_PATH")" 2>/dev/null
+        install -m 0755 "$0" "$SELF_PATH" 2>/dev/null && got="local"
+    fi
+
+    if [[ -z "$got" ]]; then
+        local tmp=""
+        tmp=$(mktemp /tmp/socks5.XXXXXX 2>/dev/null) || return 0
+        if has_cmd curl && curl -fsSL -o "$tmp" "$SELF_URL" 2>/dev/null \
+            && head -n1 "$tmp" 2>/dev/null | grep -q '^#!.*bash' \
+            && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null; then
+            install -m 0755 "$tmp" "$SELF_PATH" 2>/dev/null && got="download"
+        fi
+        rm -f "$tmp" 2>/dev/null
+    fi
+
+    if [[ -n "$got" ]]; then
         log_info "管理命令已安装: $SELF_PATH"
+    else
+        log_warn "未能安装 $SELF_PATH；下次可直接运行: bash <(curl -fsSL $SELF_URL)"
     fi
     return 0
 }
@@ -1472,6 +1498,7 @@ SOCKS5 管理脚本 v${SCRIPT_VERSION}
   restart, -r            重启服务
   logs, -l               实时日志
   stats                  操作统计
+  version, --version     显示版本与运行位置（排查版本错配用）
   help, -h               本帮助
 
 install 的非交互选项:
@@ -1541,6 +1568,13 @@ do_install_noninteractive() {
     log_usage "installed port=$SOCKS_PORT auth=$USE_AUTH (cli)"
 }
 
+show_version() {
+    echo "socks5 管理脚本 v${SCRIPT_VERSION}"
+    echo "运行位置: ${BASH_SOURCE[0]:-$0}"
+    [[ -x "$SELF_PATH" ]] && echo "已安装命令: $SELF_PATH"
+    [[ -f "$INSTALL_INFO" ]] && echo "安装记录: $INSTALL_INFO" && grep '^SCRIPT_VERSION=' "$INSTALL_INFO" 2>/dev/null | sed 's/^/  /'
+}
+
 main() {
     need_root
 
@@ -1553,6 +1587,9 @@ main() {
     mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
     log_usage "run: ${*:-menu}"
 
+    # 命令缺失就顺手装上（curl|bash 方式运行过但没装的情况）
+    [[ -x "$SELF_PATH" ]] || install_self >/dev/null 2>&1
+
     case "${1:-}" in
         "")                  handle_menu ;;
         install|--install|-i) do_install_noninteractive "$@" ;;
@@ -1564,6 +1601,7 @@ main() {
         restart|--restart|-r) load_install_info; restart_dante ;;
         logs|--logs|-l)      show_logs ;;
         stats|--stats)       show_stats ;;
+        version|--version)   show_version ;;
         help|--help|-h)      show_help ;;
         *) log_error "未知命令: $1"; show_help; exit 1 ;;
     esac
