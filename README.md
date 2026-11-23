@@ -61,8 +61,8 @@ socks5 version
 规则写在 `/etc/socks5-gost/allow.txt`：
 
 ```
-.223360.xyz        # 匹配 223360.xyz 及其一级子域（www.223360.xyz）
-*.223360.xyz       # 同上，脚本会自动改写成 .223360.xyz
+.example.com       # 匹配 example.com 及其一级子域（www.example.com）
+*.example.com      # 同上，脚本会自动改写成 .example.com
 1.2.3.4            # 单个 IP
 10.0.0.0/8         # 网段
 ```

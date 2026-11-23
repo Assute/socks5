@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 管理脚本 v1.5   (gost v2 后端)
+#  SOCKS5 管理脚本 v1.6   (gost v2 后端)
 #
 #  系统: Debian / Ubuntu / CentOS / Rocky / Alma / RHEL (systemd)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc) · 状态 · 自检 · 升级
@@ -36,7 +36,7 @@ SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/gost.sh"
 SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main"
 
 GOST_VER="2.12.0"
-SCRIPT_VERSION="1.5"
+SCRIPT_VERSION="1.6"
 BIG_RATE="10000mbit"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -374,7 +374,7 @@ allow_scan_rejected() {
     fi
 
     echo "  提示: 若资源都在自己的主域下，加一条 .你的域名 更省事"
-    echo "        例 .huosyun.com 覆盖 huosyun.com 与 www./cdn./static. 一级子域"
+    echo "        例 .example.com 覆盖 example.com 与 www./cdn./static. 一级子域"
     local c
     read -r -p "把上面 ${i} 个域名加入白名单？[y/N]: " c
     [[ "${c,,}" != "y" ]] && { log_info "已取消"; return 0; }
@@ -403,7 +403,7 @@ do_allow() {
             1) allow_show ;;
             2)
                 echo "  可一次填多个，用空格或逗号分隔"
-                echo "  .huosyun.com 覆盖主域和一级子域；裸域名 huosyun.com 只精确匹配它自己"
+                echo "  .example.com 覆盖主域和一级子域；裸域名 example.com 只精确匹配它自己"
                 read -r -p "  域名: " v
                 v="${v//,/ }"
                 # shellcheck disable=SC2086
@@ -943,38 +943,54 @@ allow_first_domain() {
         | sed 's/^\.//; s/^\*\.//'
 }
 
-# 白名单自检：挑一条列表内的域名应放行，一个必定不在列表里的域名应被拒
+# 白名单检查（配置级校验，不发真实请求）
+#
+# 为什么不靠发请求下结论：
+#   curl 对 SOCKS 代理层的错误一律返回 97(CURLE_PROXY)，
+#   「被白名单拒绝」和「目标域名解析失败」都得到 97，无法区分。
+#   实测：列表里一个不存在的域名 -> 97；列表外任意域名 -> 97。
+#   靠它判断会把 DNS 波动误报成「白名单写坏了」。
+#   要区分二者，看日志里的 Bypass 行（菜单 w→6 可自动收集）。
 test_whitelist() {
     allow_enabled || return 0
-    has_cmd curl || return 0
-    local dom rc_a rc_d
-    dom=$(allow_first_domain)
-    log_info "白名单自检（共 $(allow_count) 条规则）"
+    allow_init
+    local bad=0 r
+    log_info "白名单检查（共 $(allow_count) 条规则）"
 
-    if [[ -n "$dom" ]]; then
-        local ua=()
-        [[ "$USE_AUTH" == true ]] && ua=(--proxy-user "${USER_NAME}:${PASS_WORD}")
-        timeout 12 curl -s -o /dev/null --socks5-hostname "127.0.0.1:${PORT}" \
-            "${ua[@]}" "https://${dom}" >/dev/null 2>&1
-        rc_a=$?
-        # 97 = 被代理拒绝；只要不是 97，就说明 ACL 放行了
-        if [[ $rc_a -eq 97 ]]; then
-            log_error "白名单异常：列表内的 ${dom} 反而被拒绝（rc=97）"
-            log_error "  检查 $ALLOW_FILE 是否缺少 reverse true"
-        else
-            log_success "放行正常: ${dom}（rc=$rc_a，非 97 即 ACL 已放行）"
-        fi
-    fi
-
-    local probe="whitelist-probe-$RANDOM.invalid"
-    timeout 12 curl -s -o /dev/null --socks5-hostname "127.0.0.1:${PORT}" \
-        --proxy-user "${USER_NAME}:${PASS_WORD}" "https://${probe}" >/dev/null 2>&1
-    rc_d=$?
-    if [[ $rc_d -eq 97 ]]; then
-        log_success "拒绝正常: 列表外目标被拦截"
+    if grep -qE '^[[:space:]]*reverse[[:space:]]+true' "$ALLOW_FILE" 2>/dev/null; then
+        log_success "reverse true 存在，按白名单语义生效"
     else
-        log_warn "列表外目标未被拒绝（rc=$rc_d）—— 白名单可能没生效"
+        log_error "缺少 reverse true —— 文件方式下会退化成黑名单（危险）"
+        log_error "  在 $ALLOW_FILE 补一行:  reverse true"
+        bad=1
     fi
+
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        if [[ "$r" == *[[:space:]]* ]]; then
+            log_warn "规则含空格，可能不生效: [$r]"
+            bad=1
+        fi
+        if [[ "$r" == *"*"* && "$r" != \** ]]; then
+            log_warn "星号只应出现在开头，建议写成 .${r#\*.}: [$r]"
+        fi
+        case "$r" in
+            "*" | "~") log_warn "规则 [$r] 等于放行全部目标" ;;
+        esac
+    done < <(allow_rules)
+
+    local dup
+    dup=$(allow_rules 2>/dev/null | sort | uniq -d)
+    [[ -n "$dup" ]] && log_warn "存在重复规则: $(printf '%s ' $dup)"
+
+    [[ $bad -eq 0 ]] && log_success "配置检查通过"
+
+    local d
+    d=$(allow_first_domain)
+    echo "  验证放行（把域名换成列表里的）:"
+    [[ -n "$d" ]] && echo "    curl -o /dev/null -w '%{http_code}\\n' --socks5-hostname 127.0.0.1:$PORT --proxy-user '用户:密码' https://$d"
+    echo "  注意: curl 返回 (97) 只代表代理层失败，可能是被拒，也可能是该域名解析不了"
+    echo "        要区分请查日志里的 Bypass 行，或用菜单 w→6 自动收集"
 }
 
 test_proxy() {

@@ -1750,7 +1750,7 @@ install 的非交互选项:
   --no-auth              无认证模式（慎用）
 
 示例:
-  $0 install --port 1080 --user u1 --pass p123456
+  $0 install --port 1080 --user u1 --pass Example#2024
   $0 limit               进入限速菜单
   $0                     交互菜单
 EOF
