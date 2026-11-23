@@ -154,22 +154,36 @@ tcp_probe() {
 # ---------- 凭据 ----------
 # gost 的凭据放在 URL 里（socks5://user:pass@:port），
 # 所以必须百分号编码，否则 @ : / 会把 URL 结构撕坏。
+# 校验只挡真正会出问题的东西：空值、超长、控制字符（换行/制表等）。
+# 中文、空格、符号都放行 —— urlenc 会把它们编码成 %XX，gost 能正确解码。
+#
+# 注意：不能用 [[ =~ [[:cntrl:]] ]] 判断控制字符。
+# 在 C locale 下 bash 的正则引擎会把 UTF-8 的部分字节
+# （例如「文」的 0x96）也判成 cntrl，导致中文用户名被误拒。
+# tr 在 LC_ALL=C 下按字节分类，只处理 0x00-0x1F 和 0x7F，不误伤多字节字符。
+has_ctl() {
+    local s="$1"
+    [[ "$(printf '%s' "$s" | LC_ALL=C tr -d '[:cntrl:]')" != "$s" ]]
+}
+
 valid_user_name() {
     local v="$1"
     [[ -z "$v" ]] && return 1
     [[ ${#v} -gt 64 ]] && return 1
-    [[ "$v" =~ [[:space:]] ]] && return 1
-    # 只接受可见 ASCII，避免多字节编码进 URL 后出现歧义
-    [[ "$v" =~ ^[!-~]+$ ]] || return 1
+    has_ctl "$v" && return 1
     return 0
 }
 
 valid_password() {
     local v="$1"
-    [[ ${#v} -ge 1 && ${#v} -le 128 ]] || return 1
-    [[ "$v" =~ ^[!-~]+$ ]] || return 1
+    [[ -z "$v" ]] && return 1
+    [[ ${#v} -gt 128 ]] && return 1
+    has_ctl "$v" && return 1
     return 0
 }
+
+# 没给用户名时生成一个随机的，不再用固定的 socksuser
+gen_user() { printf 'u%s' "$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 8)"; }
 
 urlenc() {
     local s="$1" out="" i c
@@ -750,13 +764,17 @@ ask_auth() {
 
     USE_AUTH=true
     while true; do
-        read -r -p "用户名 [默认 socksuser]: " u
-        USER_NAME="${u:-socksuser}"
+        read -r -p "用户名（必填，字符不限，含中文也行）: " u
+        USER_NAME="$u"
+        if [[ -z "$USER_NAME" ]]; then
+            log_error "用户名不能为空"
+            continue
+        fi
         valid_user_name "$USER_NAME" && break
-        log_error "用户名只能是可见 ASCII（不含空格），最长 64"
+        log_error "用户名太长（上限 64）或含换行等控制字符"
     done
     while true; do
-        IFS= read -r -s -p "密码 [留空自动生成，可见 ASCII 字符不限]: " p
+        IFS= read -r -s -p "密码 [留空自动生成，字符不限]: " p
         echo
         if [[ -z "$p" ]]; then
             p=$(gen_pass)
@@ -764,7 +782,7 @@ ask_auth() {
         fi
         PASS_WORD="$p"
         valid_password "$PASS_WORD" && break
-        log_error "密码 1-128 位，只能是可见 ASCII"
+        log_error "密码太长（上限 128）或含换行等控制字符"
     done
     return 0
 }
@@ -1210,6 +1228,16 @@ do_doctor() {
     fi
     [[ $fw -eq 0 ]] && echo -e "  $na 未检测到防火墙工具"
     echo -e "  ${YELLOW}系统防火墙放行 ≠ 云安全组放行，两者都要开${NC}"
+
+    # dante 版会创建系统账号做 PAM 认证，gost 不需要；留着只是垃圾
+    local lu
+    for lu in socksuser; do
+        if id "$lu" >/dev/null 2>&1; then
+            echo
+            echo -e "  ${YELLOW}发现 dante 版遗留的系统账号: $lu（gost 不需要）${NC}"
+            echo "    删除: userdel $lu"
+        fi
+    done
     hr
     return 0
 }
@@ -1369,10 +1397,13 @@ do_install_cli() {
         USE_AUTH=false; USER_NAME=""; PASS_WORD=""
     else
         USE_AUTH=true
-        USER_NAME="${wu:-socksuser}"
+        # 没给 --user 就随机生成，不再用固定的 socksuser
+        USER_NAME="${wu:-$(gen_user)}"
         PASS_WORD="${wpp:-$(gen_pass)}"
-        valid_user_name "$USER_NAME" || die "用户名只能是可见 ASCII"
-        valid_password "$PASS_WORD" || die "密码 1-128 位可见 ASCII"
+        valid_user_name "$USER_NAME" || die "用户名太长（上限 64）或含控制字符"
+        valid_password "$PASS_WORD" || die "密码太长（上限 128）或含控制字符"
+        [[ -z "$wu" ]] && log_info "未指定 --user，已生成用户名: $USER_NAME"
+        [[ -z "$wpp" ]] && log_info "未指定 --pass，已生成密码: $PASS_WORD"
     fi
 
     [[ -x "$GOST_BIN" ]] || download_gost
