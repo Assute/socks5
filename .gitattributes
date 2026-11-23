@@ -1,0 +1,4 @@
+# 这些脚本必须在 Linux 上以 LF 执行；CRLF 会导致 "bad interpreter" 或 heredoc 解析失败
+*.sh    text eol=lf
+*.bash  text eol=lf
+socks5* text eol=lf
