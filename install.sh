@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 服务管理脚本 v3.3   (Dante SOCKS5)
+#  SOCKS5 服务管理脚本 v3.4   (Dante SOCKS5)
 #
 #  系统: Debian / Ubuntu (apt)   CentOS / Rocky / Alma / RHEL (dnf|yum)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc HTB) · 状态 · 日志 · 统计
@@ -24,7 +24,7 @@ SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/install.sh"
 LOG_FILE="/var/log/danted.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-danted"
 IFB_DEV="ifb0"
-SCRIPT_VERSION="3.3"
+SCRIPT_VERSION="3.4"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'
@@ -404,6 +404,13 @@ install_self() {
         if has_cmd curl && curl -fsSL -o "$tmp" "$SELF_URL" 2>/dev/null \
             && head -n1 "$tmp" 2>/dev/null | grep -q '^#!.*bash' \
             && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null; then
+            # raw.githubusercontent 有 CDN 缓存，刚推送后可能还拿不到新版。
+            # 版本不一致必须说出来，否则会把旧版悄悄装成常驻命令。
+            local dv
+            dv=$(sed -n 's/^SCRIPT_VERSION="\(.*\)"/\1/p' "$tmp" 2>/dev/null | head -n1)
+            if [[ -n "$dv" && "$dv" != "$SCRIPT_VERSION" ]]; then
+                log_warn "下载到的副本是 v$dv，当前运行的是 v$SCRIPT_VERSION（CDN 缓存滞后）"
+            fi
             install -m 0755 "$tmp" "$SELF_PATH" 2>/dev/null && got="download"
         fi
         rm -f "$tmp" 2>/dev/null
@@ -1571,8 +1578,14 @@ do_install_noninteractive() {
 show_version() {
     echo "socks5 管理脚本 v${SCRIPT_VERSION}"
     echo "运行位置: ${BASH_SOURCE[0]:-$0}"
-    [[ -x "$SELF_PATH" ]] && echo "已安装命令: $SELF_PATH"
-    [[ -f "$INSTALL_INFO" ]] && echo "安装记录: $INSTALL_INFO" && grep '^SCRIPT_VERSION=' "$INSTALL_INFO" 2>/dev/null | sed 's/^/  /'
+    if [[ -e "$SELF_PATH" ]]; then
+        local iv
+        iv=$(sed -n 's/^SCRIPT_VERSION="\(.*\)"/\1/p' "$SELF_PATH" 2>/dev/null | head -n1)
+        echo "已安装命令: $SELF_PATH (v${iv:-未知})"
+    else
+        echo "已安装命令: 无（${SELF_PATH} 不存在）"
+    fi
+    [[ -f "$INSTALL_INFO" ]] && grep '^SCRIPT_VERSION=' "$INSTALL_INFO" 2>/dev/null | sed 's/^/安装记录: /'
 }
 
 main() {
@@ -1588,7 +1601,8 @@ main() {
     log_usage "run: ${*:-menu}"
 
     # 命令缺失就顺手装上（curl|bash 方式运行过但没装的情况）
-    [[ -x "$SELF_PATH" ]] || install_self >/dev/null 2>&1
+    # 这里不能把输出丢掉：版本不一致的告警必须让人看见
+    [[ -x "$SELF_PATH" ]] || install_self
 
     case "${1:-}" in
         "")                  handle_menu ;;
