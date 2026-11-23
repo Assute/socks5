@@ -9,7 +9,7 @@
 | **gost v2** | `gost.sh` | 单个静态二进制，不依赖 PAM、不建系统账号，凭据只存 600 权限的 JSON。**推荐** |
 | dante | `install.sh` | 系统包管理安装，用户名认证走系统账号 / PAM，依赖多 |
 
-两个脚本装的命令都叫 `socks5`，别同时用；切换前先卸载旧的。
+gost 版装的命令是 `sk5`，dante 版装的是 `socks5`。装 gost 版时会把旧的 `socks5` 自动转成指向 `sk5` 的软链，避免新旧副本并存。
 
 ## gost 版（推荐）
 
@@ -29,16 +29,19 @@ bash <(curl -fsSL -H 'Accept: application/vnd.github.raw' \
 4) 设置限速
 ------------------------------
 5) 查看状态   6) 查看连接信息   7) 重启
-8) 实时日志   9) 自检           0) 退出
+8) 实时日志   9) 自检
+w) 白名单     u) 升级脚本       0) 退出
 ```
 
 命令行：
 
 ```bash
-socks5 install --port 8443 --user u1 --pass 'p@ss:w/rd#1'
-socks5 modify | uninstall | limit | status | info | restart | logs
-socks5 doctor        # 自检
-socks5 version
+sk5 install --port 8443 --user u1 --pass 'p@ss:w/rd#1'
+sk5 modify | uninstall | limit | status | info | restart | logs
+sk5 allow            # 目标白名单
+sk5 upgrade          # 升级脚本到最新版
+sk5 doctor           # 自检
+sk5 version
 ```
 
 这套脚本修掉了常见 gost 一键脚本的三个问题：
@@ -49,9 +52,19 @@ socks5 version
 
 凭据含 `@ : / #` 时会自动百分号编码后再写进 gost 的 URL；客户端仍用原始明文密码。
 
+### 升级脚本
+
+```bash
+sk5 upgrade
+```
+
+比对磁盘上的版本与远端最新版，只在确实更新时才覆盖 `/usr/local/sbin/sk5`，旧副本留在 `.bak`。菜单按 `u` 同效。
+
+**为什么要它**：脚本只在首次安装时写入命令文件，之后不会覆盖已存在的副本 —— 改了仓库却仍在跑旧版就是这个原因。`sk5 version` 会同时打印运行版本与已装命令的版本，不一致时提示升级。
+
 ## 目标白名单
 
-只放行你指定的域名/IP，其余目标一律拒绝。菜单里按 `w`，或命令行 `socks5 allow`。
+只放行你指定的域名/IP，其余目标一律拒绝。菜单里按 `w`，或命令行 `sk5 allow`。
 
 ```
 1) 查看规则   2) 添加   3) 删除
@@ -97,7 +110,7 @@ gost 只匹配**主域 + 一级子域**：
 bash <(curl -fsSL https://raw.githubusercontent.com/Assute/socks5/main/install.sh)
 ```
 
-拿到菜单后选序号即可。装完会注册一个 `socks5` 命令，以后再管理直接敲：
+拿到菜单后选序号即可。装完会注册一个 `sk5` 命令，以后再管理直接敲：
 
 ```bash
 socks5

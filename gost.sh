@@ -30,13 +30,15 @@ LOG_FILE="/var/log/gost-access.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-gost"
 IFB_DEV="ifb0"
 
-SELF_PATH="/usr/local/sbin/socks5"
+SELF_PATH="/usr/local/sbin/sk5"
+# 旧版装的名字；留着它会永远停在旧版本，所以转成指向 sk5 的软链
+LEGACY_SELF="/usr/local/sbin/socks5"
 SELF_NAME="gost.sh"
 SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/gost.sh"
 SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main"
 
 GOST_VER="2.12.0"
-SCRIPT_VERSION="1.6"
+SCRIPT_VERSION="1.7"
 BIG_RATE="10000mbit"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -1229,7 +1231,7 @@ show_install_complete() {
         echo -e "测试:    ${YELLOW}curl --socks5-hostname ${SERVER_IP}:${PORT} https://api.ipify.org${NC}"
     fi
     echo
-    echo -e "管理:  ${YELLOW}socks5${NC}      服务: ${YELLOW}systemctl {start|stop|restart|status} gost${NC}"
+    echo -e "管理:  ${YELLOW}sk5${NC}         服务: ${YELLOW}systemctl {start|stop|restart|status} gost${NC}"
     hr
 }
 
@@ -1350,9 +1352,16 @@ do_uninstall() {
     read -r -p "删除日志 $LOG_FILE 与统计数据？[y/N]: " c
     if [[ "${c,,}" == "y" ]]; then rm -f "$LOG_FILE"; else log_info "日志已保留"; fi
 
-    read -r -p "删除管理信息与 $SELF_PATH？[y/N]: " c
-    if [[ "${c,,}" == "y" ]]; then rm -rf "$CONFIG_DIR"; rm -f "$SELF_PATH"; log_info "管理文件已清理"
-    else log_info "管理文件已保留"; fi
+    read -r -p "删除管理信息与命令 $SELF_PATH？[y/N]: " c
+    if [[ "${c,,}" == "y" ]]; then
+        rm -rf "$CONFIG_DIR"
+        rm -f "$SELF_PATH"
+        # 旧别名若是指向 sk5 的软链，一并清掉，避免留悬空链接
+        if [[ -L "$LEGACY_SELF" ]]; then rm -f "$LEGACY_SELF"; fi
+        log_info "管理文件与命令已清理"
+    else
+        log_info "管理文件已保留"
+    fi
 
     hr
     log_success "卸载完成"
@@ -1503,14 +1512,28 @@ do_doctor() {
     local self="${BASH_SOURCE[0]:-$0}"
     local ok="${GREEN}OK${NC}" bad="${RED}FAIL${NC}" na="${YELLOW}--${NC}"
     echo
-    echo -e "${BLUE}socks5(gost) 自检${NC}"
+    echo -e "${BLUE}sk5 (gost) 自检${NC}"
     hr
 
     echo -e "${CYAN}[脚本]${NC}"
     echo "  运行位置: $self"
     echo "  运行版本: v$SCRIPT_VERSION"
     [[ -f "$self" ]] && { bash -n "$self" 2>/dev/null && echo -e "  语法自检: $ok" || echo -e "  语法自检: $bad"; }
-    [[ -x "$SELF_PATH" ]] && echo "  已装命令: $SELF_PATH" || echo -e "  已装命令: $bad 缺失"
+    if [[ -x "$SELF_PATH" ]]; then
+        local sv
+        sv=$(ver_of "$SELF_PATH")
+        echo "  已装命令: $SELF_PATH（v$sv）"
+        if [[ -n "$sv" && "$sv" != "$SCRIPT_VERSION" ]]; then
+            echo -e "  ${YELLOW}版本不一致：当前跑的是 v$SCRIPT_VERSION，磁盘上是 v$sv${NC}"
+            echo -e "  ${YELLOW}  执行 sk5 upgrade 更新（旧副本不会自动覆盖）${NC}"
+        fi
+    else
+        echo -e "  已装命令: $bad 缺失（执行 sk5 upgrade 或重装脚本）"
+    fi
+    if [[ -f "$LEGACY_SELF" && ! -L "$LEGACY_SELF" ]]; then
+        echo -e "  ${YELLOW}发现旧副本 $LEGACY_SELF（v$(ver_of "$LEGACY_SELF")），它不会随升级更新${NC}"
+        echo -e "  ${YELLOW}  建议: rm -f $LEGACY_SELF，统一用 sk5${NC}"
+    fi
     local iv; iv=$(info_version); [[ -n "$iv" ]] && echo "  安装记录: v$iv"
 
     echo
@@ -1662,11 +1685,21 @@ do_doctor() {
 }
 
 show_version() {
-    echo "socks5 (gost) 管理脚本 v$SCRIPT_VERSION"
+    echo "sk5 (gost) 管理脚本 v$SCRIPT_VERSION"
     echo "运行位置: ${BASH_SOURCE[0]:-$0}"
-    [[ -x "$SELF_PATH" ]] && echo "已安装命令: $SELF_PATH" || echo "已安装命令: 无"
+    if [[ -x "$SELF_PATH" ]]; then
+        echo "已装命令: $SELF_PATH（v$(ver_of "$SELF_PATH")）"
+    else
+        echo "已装命令: 无"
+    fi
+    if [[ -L "$LEGACY_SELF" ]]; then
+        echo "兼容别名: $LEGACY_SELF -> $(readlink "$LEGACY_SELF" 2>/dev/null)"
+    elif [[ -f "$LEGACY_SELF" ]]; then
+        echo "旧副本:   $LEGACY_SELF（v$(ver_of "$LEGACY_SELF")，建议 rm 掉，用 sk5）"
+    fi
     [[ -x "$GOST_BIN" ]] && echo "gost: $("$GOST_BIN" -V 2>/dev/null | head -n1)"
     local iv; iv=$(info_version); [[ -n "$iv" ]] && echo "安装记录版本: v$iv"
+    echo "升级: sk5 upgrade"
     return 0
 }
 
@@ -1684,29 +1717,117 @@ show_stats() {
     echo "  限速变更: $(count_in 'limit ' "$STATS_FILE")"
 }
 
-# ---------- 自安装 ----------
+# ---------- 自安装 / 升级 ----------
+ver_of() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)".*/\1/p' "$f" 2>/dev/null | head -n1
+}
+
+# $1 是否比 $2 新
+ver_newer() {
+    local a="$1" b="$2" i A B
+    [[ -z "$a" ]] && return 1
+    [[ -z "$b" ]] && return 0
+    [[ "$a" == "$b" ]] && return 1
+    for i in 1 2 3 4; do
+        A=$(printf '%s' "$a" | cut -d. -f$i); A=${A:-0}
+        B=$(printf '%s' "$b" | cut -d. -f$i); B=${B:-0}
+        [[ "$A" =~ ^[0-9]+$ ]] || A=0
+        [[ "$B" =~ ^[0-9]+$ ]] || B=0
+        [[ "$A" -gt "$B" ]] && return 0
+        [[ "$A" -lt "$B" ]] && return 1
+    done
+    return 1
+}
+
+# 下载本脚本到指定路径，并校验确实是本脚本
+fetch_script() {
+    local out="$1"
+    { curl -fsSL --max-time 25 -H 'Accept: application/vnd.github.raw' "$SELF_API_URL" -o "$out" 2>/dev/null \
+        || curl -fsSL --max-time 25 "$SELF_URL" -o "$out" 2>/dev/null; } || return 1
+    [[ -s "$out" ]] || return 1
+    head -n1 "$out" 2>/dev/null | grep -q '^#!.*bash' || return 1
+    grep -q 'SCRIPT_VERSION=' "$out" 2>/dev/null || return 1
+    return 0
+}
+
+# 把旧的 socks5 换成指向 sk5 的软链，避免两个版本的副本并存
+link_legacy_self() {
+    [[ "$LEGACY_SELF" == "$SELF_PATH" ]] && return 0
+    if [[ -L "$LEGACY_SELF" ]]; then
+        ln -sfn "$SELF_PATH" "$LEGACY_SELF" 2>/dev/null
+        return 0
+    fi
+    [[ -f "$LEGACY_SELF" ]] || return 0
+    # 只接管确实是本脚本装的那份，别人的文件不动
+    grep -q 'SCRIPT_VERSION=' "$LEGACY_SELF" 2>/dev/null || return 0
+    ln -sfn "$SELF_PATH" "$LEGACY_SELF" 2>/dev/null \
+        && log_info "旧命令 $LEGACY_SELF 已改为指向 $SELF_PATH"
+    return 0
+}
+
 install_self() {
-    if [[ -f "$0" ]] && [[ "$(readlink -f "$0" 2>/dev/null)" == "$(readlink -f "$SELF_PATH" 2>/dev/null)" ]]; then
+    local self="${BASH_SOURCE[0]:-$0}"
+    if [[ -f "$self" ]] && [[ "$(readlink -f "$self" 2>/dev/null)" == "$(readlink -f "$SELF_PATH" 2>/dev/null)" ]]; then
+        link_legacy_self
         return 0
     fi
     local got=""
-    if [[ -f "$0" && -r "$0" ]]; then
+    if [[ -f "$self" && -r "$self" ]]; then
         mkdir -p "$(dirname "$SELF_PATH")" 2>/dev/null
-        install -m 0755 "$0" "$SELF_PATH" 2>/dev/null && got="local"
+        install -m 0755 "$self" "$SELF_PATH" 2>/dev/null && got="local"
     fi
     if [[ -z "$got" ]] && has_cmd curl; then
         # bash <(curl ...) 时 $0 是管道，只能重新拉一份
         local tmp
-        tmp=$(mktemp /tmp/socks5g.XXXXXX 2>/dev/null) || return 0
-        if curl -fsSL --max-time 25 -H 'Accept: application/vnd.github.raw' "$SELF_API_URL" -o "$tmp" 2>/dev/null \
-            || curl -fsSL --max-time 25 "$SELF_URL" -o "$tmp" 2>/dev/null; then
-            if head -n1 "$tmp" 2>/dev/null | grep -q '^#!.*bash' && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null; then
-                install -m 0755 "$tmp" "$SELF_PATH" 2>/dev/null && got="download"
-            fi
+        tmp=$(mktemp /tmp/sk5.XXXXXX 2>/dev/null) || return 0
+        if fetch_script "$tmp"; then
+            install -m 0755 "$tmp" "$SELF_PATH" 2>/dev/null && got="download"
         fi
         rm -f "$tmp" 2>/dev/null
     fi
-    [[ -n "$got" ]] && log_info "管理命令已安装: $SELF_PATH"
+    [[ -n "$got" ]] && log_info "管理命令已安装: $SELF_PATH（v$SCRIPT_VERSION）"
+    link_legacy_self
+    return 0
+}
+
+do_upgrade() {
+    has_cmd curl || { log_error "缺少 curl，无法升级"; return 1; }
+    local cur new tmp
+    # 以磁盘上的版本为基准：本进程的 SCRIPT_VERSION 不会变
+    cur=$(ver_of "$SELF_PATH")
+    [[ -z "$cur" ]] && cur="$SCRIPT_VERSION"
+    log_info "已装版本: v$cur"
+    echo "  获取最新版本..."
+    tmp=$(mktemp /tmp/sk5up.XXXXXX) || return 1
+    if ! fetch_script "$tmp"; then
+        rm -f "$tmp"
+        log_error "下载失败，检查网络后重试"
+        return 1
+    fi
+    new=$(ver_of "$tmp")
+    if [[ -z "$new" ]]; then
+        rm -f "$tmp"
+        log_error "下载内容没有版本标记，拒绝替换"
+        return 1
+    fi
+    if ! ver_newer "$new" "$cur"; then
+        rm -f "$tmp"
+        log_success "已是最新版本（v$cur）"
+        return 0
+    fi
+    log_info "发现新版本: v$cur → v$new"
+    if ! install -m 0755 "$tmp" "$SELF_PATH"; then
+        rm -f "$tmp"
+        log_error "写入 $SELF_PATH 失败"
+        return 1
+    fi
+    rm -f "$tmp"
+    link_legacy_self
+    log_success "管理脚本已升级到 v$new"
+    echo "  当前进程仍是 v$SCRIPT_VERSION，重新执行 sk5 即为新版本"
+    log_usage "upgraded $cur -> $new"
     return 0
 }
 
@@ -1723,7 +1844,7 @@ show_menu() {
     fi
     echo
     echo "=================================================="
-    echo -e "  ${BOLD}SOCKS5 管理脚本 v${SCRIPT_VERSION}${NC}  (gost ${GOST_VER})"
+    echo -e "  ${BOLD}sk5 - SOCKS5 管理脚本 v${SCRIPT_VERSION}${NC}  (gost ${GOST_VER})"
     echo -e "  状态: ${state}"
     echo -e "  限速: $(limit_status_text)"
     echo -e "  白名单: $(allow_status_text)"
@@ -1739,6 +1860,7 @@ show_menu() {
     echo -e "  ${CYAN}7${NC}) 重启服务"
     echo -e "  ${CYAN}8${NC}) 实时日志"
     echo -e "  ${CYAN}9${NC}) 自检 (doctor)"
+    echo -e "  ${CYAN}u${NC}) 升级脚本"
     echo -e "  ${CYAN}0${NC}) 退出"
     echo
 }
@@ -1746,7 +1868,7 @@ show_menu() {
 handle_menu() {
     while true; do
         show_menu
-        read -r -p "请选择 [0-9/w]: " choice
+        read -r -p "请选择 [0-9/w/u]: " choice
         case "$choice" in
             1) do_install ;;
             2) do_modify ;;
@@ -1758,8 +1880,9 @@ handle_menu() {
             7) load_install_info; restart_gost ;;
             8) show_logs ;;
             9) do_doctor ;;
+            u|U|upgrade) do_upgrade ;;
             0) log_info "已退出"; log_usage "exit"; exit 0 ;;
-            *) log_error "无效选项，请输入 0-9 或 w" ;;
+            *) log_error "无效选项，请输入 0-9、w 或 u" ;;
         esac
         echo
         read -r -p "按回车继续..." -r _
@@ -1768,7 +1891,7 @@ handle_menu() {
 
 show_help() {
     cat <<EOF
-SOCKS5 管理脚本 v${SCRIPT_VERSION}（gost ${GOST_VER} 后端）
+sk5 - SOCKS5 管理脚本 v${SCRIPT_VERSION}（gost ${GOST_VER} 后端）
 
 用法: $0 [命令] [选项]
 
@@ -1782,6 +1905,7 @@ SOCKS5 管理脚本 v${SCRIPT_VERSION}（gost ${GOST_VER} 后端）
   restart, -r          重启服务
   logs, -l             实时日志
   allow                白名单管理（只放行指定域名）
+  upgrade              升级脚本到最新版
   doctor               自检
   stats                操作统计
   version              版本
@@ -1893,6 +2017,7 @@ main() {
         restart|--restart|-r)      load_install_info; restart_gost ;;
         logs|--logs|-l)            show_logs ;;
         allow|--allow)             do_allow ;;
+        upgrade|--upgrade|-U)      install_self; do_upgrade ;;
         doctor|--doctor)           do_doctor ;;
         stats|--stats)             show_stats ;;
         version|--version)         show_version ;;
