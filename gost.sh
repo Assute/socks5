@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 管理脚本 v1.4   (gost v2 后端)
+#  SOCKS5 管理脚本 v1.5   (gost v2 后端)
 #
 #  系统: Debian / Ubuntu / CentOS / Rocky / Alma / RHEL (systemd)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc) · 状态 · 自检 · 升级
@@ -36,7 +36,7 @@ SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/gost.sh"
 SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main"
 
 GOST_VER="2.12.0"
-SCRIPT_VERSION="1.4"
+SCRIPT_VERSION="1.5"
 BIG_RATE="10000mbit"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -330,6 +330,59 @@ allow_show() {
     echo "        文件改动后 10 秒内自动生效（reload 10s）"
 }
 
+# 从 gost 日志里回收被白名单拒绝的域名
+# gost 拒绝时的日志形态： socks.go:904: [socks5] ... : Bypass cdn.jsdelivr.net:443
+allow_scan_rejected() {
+    has_cmd journalctl || { log_error "需要 journalctl"; return 1; }
+    local since="${1:-2 hours ago}" tmp n h i=0
+    tmp=$(mktemp) || return 1
+    journalctl -u gost --since "$since" --no-pager 2>/dev/null \
+        | grep -oE 'Bypass [^ ]+:[0-9]+' \
+        | sed 's/^Bypass //; s/:[0-9]*$//' \
+        | grep -vE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+        | sort -u >"$tmp"
+
+    n=$(grep -c . "$tmp" 2>/dev/null || true)
+    echo
+    if [[ "${n:-0}" -eq 0 ]]; then
+        rm -f "$tmp"
+        log_info "最近 ${since} 没有被拒绝的域名记录"
+        return 0
+    fi
+
+    echo -e "${CYAN}最近 ${since} 被拒绝的域名（已排除纯 IP）${NC}"
+    hr
+    local list=""
+    while IFS= read -r h; do
+        [[ -z "$h" ]] && continue
+        # 已被现有规则覆盖的跳过：精确、点开头、以及父域点开头
+        if allow_rules | grep -qxF -- "$h" 2>/dev/null \
+            || allow_rules | grep -qxF -- ".$h" 2>/dev/null \
+            || allow_rules | grep -qxF -- ".${h#*.}" 2>/dev/null; then
+            continue
+        fi
+        i=$((i + 1))
+        printf '  %2d) %s\n' "$i" "$h"
+        list+="$h "
+    done <"$tmp"
+    rm -f "$tmp"
+    hr
+
+    if [[ $i -eq 0 ]]; then
+        log_success "没有需要新增的域名（拒绝记录都已被现有规则覆盖）"
+        return 0
+    fi
+
+    echo "  提示: 若资源都在自己的主域下，加一条 .你的域名 更省事"
+    echo "        例 .huosyun.com 覆盖 huosyun.com 与 www./cdn./static. 一级子域"
+    local c
+    read -r -p "把上面 ${i} 个域名加入白名单？[y/N]: " c
+    [[ "${c,,}" != "y" ]] && { log_info "已取消"; return 0; }
+    # shellcheck disable=SC2086
+    allow_add $list
+    apply_allow
+}
+
 do_allow() {
     allow_init
     local ch v
@@ -342,13 +395,15 @@ do_allow() {
         echo "  3) 删除规则"
         echo "  4) 清空（改回放行全部目标）"
         echo "  5) 重新应用到服务"
+        echo "  6) 从日志收集被拒的域名（补规则用）"
         echo "  0) 返回"
         echo
         read -r -p "请选择: " ch
         case "$ch" in
             1) allow_show ;;
             2)
-                echo "  可一次填多个，用空格或逗号分隔；支持 *.example.com"
+                echo "  可一次填多个，用空格或逗号分隔"
+                echo "  .huosyun.com 覆盖主域和一级子域；裸域名 huosyun.com 只精确匹配它自己"
                 read -r -p "  域名: " v
                 v="${v//,/ }"
                 # shellcheck disable=SC2086
@@ -368,6 +423,7 @@ do_allow() {
                 apply_allow
                 ;;
             5) apply_allow ;;
+            6) allow_scan_rejected ;;
             0) return 0 ;;
             *) log_error "无效选择" ;;
         esac
