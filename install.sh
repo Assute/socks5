@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 服务管理脚本 v3.6   (Dante SOCKS5)
+#  SOCKS5 服务管理脚本 v3.7   (Dante SOCKS5)
 #
 #  系统: Debian / Ubuntu (apt)   CentOS / Rocky / Alma / RHEL (dnf|yum)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc HTB) · 状态 · 日志 · 统计
@@ -26,7 +26,7 @@ SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/install.sh?ref
 LOG_FILE="/var/log/danted.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-danted"
 IFB_DEV="ifb0"
-SCRIPT_VERSION="3.6"
+SCRIPT_VERSION="3.7"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'
@@ -163,16 +163,31 @@ save_install_info() {
         printf 'SERVER_IP=%q\n'    "$SERVER_IP"
         printf 'INTERFACE=%q\n'    "$INTERFACE"
         printf 'INSTALL_DATE=%q\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-        printf 'SCRIPT_VERSION=%q\n' "$SCRIPT_VERSION"
+        # 不能叫 SCRIPT_VERSION：source 这个文件会把运行中的 $SCRIPT_VERSION 覆盖成
+        # 「安装当时的版本」，导致菜单、升级比较、refresh 全部报错版本号
+        printf 'MANAGER_VERSION=%q\n' "$SCRIPT_VERSION"
     } >"$INSTALL_INFO"
     chmod 600 "$INSTALL_INFO"
 }
 
 load_install_info() {
     [[ -f "$INSTALL_INFO" ]] || return 1
+    # 这里 source 的是数据文件，绝不能让它污染脚本自身的运行状态。
+    # 老版本记录里写的是 SCRIPT_VERSION=，同样要挡掉。
+    local _saved_version="$SCRIPT_VERSION"
     # shellcheck disable=SC1090
     source "$INSTALL_INFO" 2>/dev/null
+    SCRIPT_VERSION="$_saved_version"
     return 0
+}
+
+# 读安装记录里记录的版本（新键优先，兼容旧键）
+info_version() {
+    [[ -f "$INSTALL_INFO" ]] || return 0
+    local v
+    v=$(sed -n 's/^MANAGER_VERSION=//p' "$INSTALL_INFO" 2>/dev/null | tr -d "'\"" | head -n1)
+    [[ -z "$v" ]] && v=$(sed -n 's/^SCRIPT_VERSION=//p' "$INSTALL_INFO" 2>/dev/null | tr -d "'\"" | head -n1)
+    printf '%s' "$v"
 }
 
 load_limit_conf() {
@@ -533,7 +548,17 @@ do_upgrade() {
         return 1
     fi
     rm -f "$tmp"
-    log_success "脚本已升级: v$cur → v$new"
+
+    # 装完必须回读校验：写失败、写到别处、文件被截断，都在这里暴露
+    local iv
+    iv=$(ver_of "$SELF_PATH")
+    if [[ "$iv" != "$new" ]]; then
+        log_error "安装后校验失败：$SELF_PATH 现在是 v${iv:-未知}，期望 v$new"
+        log_error "可能原因：磁盘满、权限、或下载内容不完整"
+        return 1
+    fi
+
+    log_success "脚本已升级: v$cur → v$new（已回读校验）"
     log_usage "upgrade $cur -> $new"
 
     # 关键：换脚本不等于换配置。新版本的 danted.conf / systemd 单元生成逻辑
@@ -1682,6 +1707,7 @@ SOCKS5 管理脚本 v${SCRIPT_VERSION}
   stats                  操作统计
   upgrade, --upgrade     检查并升级脚本（拉取最新版）
   refresh, --refresh     按安装记录重建 danted.conf 与 systemd 单元并重启
+  doctor, --doctor       自检：脚本/服务/配置/限速一次列清
   version, --version     显示版本与运行位置（排查版本错配用）
   help, -h               本帮助
 
@@ -1756,13 +1782,103 @@ show_version() {
     echo "socks5 管理脚本 v${SCRIPT_VERSION}"
     echo "运行位置: ${BASH_SOURCE[0]:-$0}"
     if [[ -e "$SELF_PATH" ]]; then
-        local iv
-        iv=$(sed -n 's/^SCRIPT_VERSION="\(.*\)"/\1/p' "$SELF_PATH" 2>/dev/null | head -n1)
-        echo "已安装命令: $SELF_PATH (v${iv:-未知})"
+        echo "已安装命令: $SELF_PATH (v$(ver_of "$SELF_PATH"))"
     else
         echo "已安装命令: 无（${SELF_PATH} 不存在）"
     fi
-    [[ -f "$INSTALL_INFO" ]] && grep '^SCRIPT_VERSION=' "$INSTALL_INFO" 2>/dev/null | sed 's/^/安装记录: /'
+    local iv
+    iv=$(info_version)
+    [[ -n "$iv" ]] && echo "安装记录版本: v$iv"
+}
+
+# 自检：把「脚本版本 / 文件完整性 / 已装命令 / 服务 / 配置 / 限速」一次列清
+do_doctor() {
+    local self="${BASH_SOURCE[0]:-$0}"
+    local ok="${GREEN}OK${NC}" bad="${RED}FAIL${NC}" na="${YELLOW}--${NC}"
+    echo
+    echo -e "${BLUE}socks5 自检${NC}"
+    hr
+
+    echo -e "${CYAN}[脚本]${NC}"
+    echo "  运行位置: $self"
+    echo "  运行版本: v$SCRIPT_VERSION"
+    if [[ -f "$self" ]]; then
+        if bash -n "$self" 2>/dev/null; then
+            echo -e "  语法自检: $ok"
+        else
+            echo -e "  语法自检: $bad （文件不完整或被截断）"
+        fi
+        echo "  文件大小: $(wc -c <"$self" 2>/dev/null) 字节"
+    fi
+    if [[ -e "$SELF_PATH" ]]; then
+        echo "  已装命令: $SELF_PATH (v$(ver_of "$SELF_PATH"))"
+    else
+        echo -e "  已装命令: $bad 缺失"
+    fi
+    local iv; iv=$(info_version)
+    if [[ -n "$iv" ]]; then
+        echo "  安装记录: v$iv"
+    else
+        echo -e "  安装记录: $na 无"
+    fi
+
+    echo
+    echo -e "${CYAN}[服务]${NC}"
+    if dante_installed; then
+        dante_running && echo -e "  danted:   $ok 运行中" || echo -e "  danted:   $bad 未运行"
+        if [[ -f "$S5_UNIT" ]]; then
+            local t km pf
+            t=$(sed -n 's/^Type=//p' "$S5_UNIT" | head -n1)
+            km=$(sed -n 's/^KillMode=//p' "$S5_UNIT" | head -n1)
+            pf=$(grep -c '^PIDFile=' "$S5_UNIT" 2>/dev/null)
+            echo "  unit:     Type=${t:-默认} KillMode=${km:-默认} PIDFile=${pf}"
+            if [[ "$t" == "simple" && "$pf" == "0" ]]; then
+                echo -e "  单元格式: $ok"
+            else
+                echo -e "  单元格式: ${YELLOW}旧格式，跑 socks5 refresh 修正${NC}"
+            fi
+        fi
+    else
+        echo -e "  danted:   $na 未安装"
+    fi
+
+    echo
+    echo -e "${CYAN}[配置]${NC}"
+    if [[ -f "$DANTE_CONF" ]]; then
+        echo "  $DANTE_CONF: $(wc -l <"$DANTE_CONF") 行"
+        local bin="$DANTE_BIN"
+        [[ -x "$bin" ]] || bin=$(command -v danted 2>/dev/null)
+        if [[ -x "$bin" ]]; then
+            if local vl; vl=$("$bin" -V -f "$DANTE_CONF" 2>&1); then
+                echo -e "  配置校验: $ok"
+            else
+                echo -e "  配置校验: $bad"
+                printf '    %s\n' "$vl"
+            fi
+        else
+            echo -e "  配置校验: $na 找不到 danted"
+        fi
+        echo "  监听地址: $(sed -n 's/^internal: //p' "$DANTE_CONF" | head -n1)"
+        echo "  出口网卡: $(sed -n 's/^external: //p' "$DANTE_CONF" | head -n1)"
+    else
+        echo -e "  $DANTE_CONF: $na 不存在"
+    fi
+
+    echo
+    echo -e "${CYAN}[端口与限速]${NC}"
+    if load_install_info; then
+        echo "  SOCKS 端口: $SOCKS_PORT"
+        if port_listening "$SOCKS_PORT"; then
+            echo -e "  监听状态: $ok"
+        else
+            echo -e "  监听状态: $bad 未监听"
+        fi
+    else
+        echo -e "  安装信息: $na 缺失"
+    fi
+    echo "  限速: $(limit_status_text)"
+    hr
+    return 0
 }
 
 main() {
@@ -1795,6 +1911,7 @@ main() {
         upgrade|--upgrade)   do_upgrade "${2:-}" ;;
         refresh|--refresh)   do_refresh ;;
         version|--version)   show_version ;;
+        doctor|--doctor)     do_doctor ;;
         help|--help|-h)      show_help ;;
         *) log_error "未知命令: $1"; show_help; exit 1 ;;
     esac

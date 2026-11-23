@@ -69,6 +69,43 @@ socks5 version
 
 会同时打印**正在运行的版本**、**已安装命令的版本**、**安装记录里的版本**，三者不一致一眼可见。
 
+## 自检
+
+出问题时先跑这个，比逐个猜快得多：
+
+```bash
+socks5 doctor
+```
+
+```
+[脚本]
+  运行位置: /usr/local/sbin/socks5
+  运行版本: v3.7
+  语法自检: OK
+  已装命令: /usr/local/sbin/socks5 (v3.7)
+  安装记录: v3.7
+
+[服务]
+  danted:   OK 运行中
+  unit:     Type=simple KillMode=mixed PIDFile=0
+  单元格式: OK
+
+[配置]
+  /etc/danted.conf: 42 行
+  配置校验: OK
+  监听地址: 0.0.0.0 port = 3030
+  出口网卡: eth0
+
+[端口与限速]
+  SOCKS 端口: 3030
+  监听状态: OK
+  限速: 下载 2mbit / 上传 2mbit
+```
+
+任何一项是 `FAIL` 或「旧格式」，下面该跑什么就清楚了。
+
+> 版本号的一个坑：早期版本把脚本版本也存在 `install_info.conf` 里并用了 `SCRIPT_VERSION` 这个键名，`source` 该文件时会覆盖掉运行中的 `$SCRIPT_VERSION`，导致菜单、升级比较、refresh 全部报错版本号（代码是新的，显示是旧的）。v3.7 起记录键改名为 `MANAGER_VERSION`，且 `load_install_info` 会保护运行版本不被污染。
+
 ## 限速
 
 dante 本身不支持限速，这里用 Linux `tc` 的 HTB 队列在网卡层整形。
@@ -101,6 +138,7 @@ socks5 status | info | restart | logs | stats
 socks5 upgrade                           # 检查并升级脚本
 socks5 refresh                           # 按安装记录重建配置并重启
 socks5 version                           # 查版本（含已安装命令的版本）
+socks5 doctor                            # 自检：脚本/服务/配置/限速一次列清
 socks5 uninstall
 ```
 
