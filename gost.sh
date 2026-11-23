@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 管理脚本 v1.1   (gost v2 后端)
+#  SOCKS5 管理脚本 v1.2   (gost v2 后端)
 #
 #  系统: Debian / Ubuntu / CentOS / Rocky / Alma / RHEL (systemd)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc) · 状态 · 自检 · 升级
@@ -35,7 +35,7 @@ SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/gost.sh"
 SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main"
 
 GOST_VER="2.12.0"
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
 BIG_RATE="10000mbit"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -508,11 +508,13 @@ shaping_apply() {
     if [[ -n "$down" ]]; then
         tc qdisc add dev "$ifc" root handle 1: htb default 30 2>/dev/null || {
             log_error "创建出方向 htb 失败"; return 1; }
-        tc class add dev "$ifc" parent 1:   classid 1:1  htb rate "$BIG_RATE" ceil "$BIG_RATE" 2>/dev/null
-        tc class add dev "$ifc" parent 1:1 classid 1:10 htb rate "$down" ceil "$down" 2>/dev/null
-        tc class add dev "$ifc" parent 1:1 classid 1:30 htb rate "$BIG_RATE" ceil "$BIG_RATE" 2>/dev/null
-        tc qdisc add dev "$ifc" parent 1:10 fq_codel 2>/dev/null
-        tc qdisc add dev "$ifc" parent 1:30 fq_codel 2>/dev/null
+        # burst/cburst 必须显式给：不写时内核按 rate 推算，
+        # 低速率下可能小于一个 MTU，结果不是限速而是全丢包
+        tc class add dev "$ifc" parent 1:   classid 1:1  htb rate "$BIG_RATE" ceil "$BIG_RATE" burst 32k cburst 32k 2>/dev/null
+        tc class add dev "$ifc" parent 1:1 classid 1:10 htb rate "$down" ceil "$down" burst 32k cburst 32k 2>/dev/null
+        tc class add dev "$ifc" parent 1:1 classid 1:30 htb rate "$BIG_RATE" ceil "$BIG_RATE" burst 32k cburst 32k 2>/dev/null
+        tc qdisc add dev "$ifc" parent 1:10 fq_codel limit 10240 2>/dev/null
+        tc qdisc add dev "$ifc" parent 1:30 fq_codel limit 10240 2>/dev/null
         tc filter add dev "$ifc" parent 1: protocol ip prio 1 u32 \
             match ip sport "$port" 0xffff flowid 1:10 2>/dev/null
         [[ $? -ne 0 ]] && { log_warn "出方向过滤器添加失败"; rc=1; }
@@ -531,9 +533,9 @@ shaping_apply() {
         [[ $? -ne 0 ]] && { log_warn "入方向重定向失败"; rc=1; }
 
         tc qdisc add dev "$IFB_DEV" root handle 2: htb default 10 2>/dev/null
-        tc class add dev "$IFB_DEV" parent 2:   classid 2:1  htb rate "$BIG_RATE" ceil "$BIG_RATE" 2>/dev/null
-        tc class add dev "$IFB_DEV" parent 2:1 classid 2:10 htb rate "$up" ceil "$up" 2>/dev/null
-        tc qdisc add dev "$IFB_DEV" parent 2:10 fq_codel 2>/dev/null
+        tc class add dev "$IFB_DEV" parent 2:   classid 2:1  htb rate "$BIG_RATE" ceil "$BIG_RATE" burst 32k cburst 32k 2>/dev/null
+        tc class add dev "$IFB_DEV" parent 2:1 classid 2:10 htb rate "$up" ceil "$up" burst 32k cburst 32k 2>/dev/null
+        tc qdisc add dev "$IFB_DEV" parent 2:10 fq_codel limit 10240 2>/dev/null
     fi
 
     return $rc
@@ -573,11 +575,11 @@ clear_all
 
 if [ -n "\$down" ]; then
     tc qdisc add dev "\$iface" root handle 1: htb default 30 || exit 1
-    tc class add dev "\$iface" parent 1:   classid 1:1  htb rate "\$BIG" ceil "\$BIG" 2>/dev/null
-    tc class add dev "\$iface" parent 1:1 classid 1:10 htb rate "\$down" ceil "\$down" 2>/dev/null
-    tc class add dev "\$iface" parent 1:1 classid 1:30 htb rate "\$BIG" ceil "\$BIG" 2>/dev/null
-    tc qdisc add dev "\$iface" parent 1:10 fq_codel 2>/dev/null
-    tc qdisc add dev "\$iface" parent 1:30 fq_codel 2>/dev/null
+    tc class add dev "\$iface" parent 1:   classid 1:1  htb rate "\$BIG" ceil "\$BIG" burst 32k cburst 32k 2>/dev/null
+    tc class add dev "\$iface" parent 1:1 classid 1:10 htb rate "\$down" ceil "\$down" burst 32k cburst 32k 2>/dev/null
+    tc class add dev "\$iface" parent 1:1 classid 1:30 htb rate "\$BIG" ceil "\$BIG" burst 32k cburst 32k 2>/dev/null
+    tc qdisc add dev "\$iface" parent 1:10 fq_codel limit 10240 2>/dev/null
+    tc qdisc add dev "\$iface" parent 1:30 fq_codel limit 10240 2>/dev/null
     tc filter add dev "\$iface" parent 1: protocol ip prio 1 u32 \\
         match ip sport "\$port" 0xffff flowid 1:10 2>/dev/null
 fi
@@ -591,9 +593,9 @@ if [ -n "\$up" ]; then
         match ip dport "\$port" 0xffff \\
         action mirred egress redirect dev "\$IFB" 2>/dev/null
     tc qdisc add dev "\$IFB" root handle 2: htb default 10 2>/dev/null
-    tc class add dev "\$IFB" parent 2:   classid 2:1  htb rate "\$BIG" ceil "\$BIG" 2>/dev/null
-    tc class add dev "\$IFB" parent 2:1 classid 2:10 htb rate "\$up" ceil "\$up" 2>/dev/null
-    tc qdisc add dev "\$IFB" parent 2:10 fq_codel 2>/dev/null
+    tc class add dev "\$IFB" parent 2:   classid 2:1  htb rate "\$BIG" ceil "\$BIG" burst 32k cburst 32k 2>/dev/null
+    tc class add dev "\$IFB" parent 2:1 classid 2:10 htb rate "\$up" ceil "\$up" burst 32k cburst 32k 2>/dev/null
+    tc qdisc add dev "\$IFB" parent 2:10 fq_codel limit 10240 2>/dev/null
 fi
 
 exit 0
@@ -798,7 +800,12 @@ ask_auth() {
     m="${m:-1}"
 
     if [[ "$m" == "2" ]]; then
-        echo -n "确认开放无认证代理？任何人拿到 IP:端口 就能用 [y/N]: "
+        echo
+        echo -e "${RED}无认证代理一旦公网可达，通常几分钟内就会被扫描器收录：${NC}"
+        echo -e "${RED}  然后陌生人的流量会把带宽和连接数吃满，${NC}"
+        echo -e "${RED}  表现就是「刚搭建能用几秒，之后自己反而连不上」。${NC}"
+        echo -e "  只在内网、或已用安全组限制来源 IP 时才选这个。"
+        echo -n "确认使用无认证模式？[y/N]: "
         read -r c
         [[ "${c,,}" != "y" ]] && { ask_auth; return; }
         USE_AUTH=false; USER_NAME=""; PASS_WORD=""
@@ -1251,6 +1258,37 @@ do_doctor() {
         echo -e "  安装信息: $na 缺失"
     fi
     echo "  限速: $(limit_status_text)"
+
+    echo
+    echo -e "${CYAN}[滥用风险]${NC}"
+    if load_install_info; then
+        if [[ "$USE_AUTH" != true ]]; then
+            echo -e "  认证:     ${RED}未启用${NC}"
+            echo -e "  ${RED}无认证 + 公网可达 = 数分钟内被扫描器收录，成为开放代理${NC}"
+            echo "  典型表现：刚搭建能用几秒，随后自己的连接反而超时（带宽被白嫖流量挤占）"
+        else
+            echo -e "  认证:     $ok 已启用（${USER_NAME}）"
+        fi
+        if has_cmd ss; then
+            local cn
+            cn=$(ss -Htn state established 2>/dev/null | awk -v w=":$PORT" '$4 ~ (w "$")' | wc -l)
+            echo "  当前连接: ${cn:-0}"
+            if [[ "${cn:-0}" -gt 20 && "$USE_AUTH" != true ]]; then
+                echo -e "  ${RED}连接数异常偏高，很可能正在被他人使用${NC}"
+            fi
+        fi
+        # 近 10 分钟出现过的客户端 IP 数量，用于判断是否被外部滥用
+        if has_cmd journalctl; then
+            local ips
+            ips=$(journalctl -u gost --since '-10 min' --no-pager 2>/dev/null \
+                | grep -oE '\[socks5\] [0-9]{1,3}(\.[0-9]{1,3}){3}' \
+                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | wc -l)
+            echo "  近10分钟客户端IP数: ${ips:-0}"
+            [[ "${ips:-0}" -gt 3 ]] && echo -e "  ${YELLOW}IP 数偏多，正常自用通常 1-2 个${NC}"
+        fi
+    else
+        echo -e "  安装信息: $na 缺失"
+    fi
 
     echo
     echo -e "${CYAN}[防火墙]${NC}"
