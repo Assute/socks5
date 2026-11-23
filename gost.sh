@@ -26,8 +26,6 @@ UNIT="/etc/systemd/system/gost.service"
 
 SHAPING_UNIT="/etc/systemd/system/gost-shaping.service"
 SHAPING_HELPER="/usr/local/sbin/gost-shaping"
-LOG_FILE="/var/log/gost-access.log"
-LOGROTATE_FILE="/etc/logrotate.d/socks5-gost"
 IFB_DEV="ifb0"
 
 SELF_PATH="/usr/local/sbin/sk5"
@@ -38,7 +36,7 @@ SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/gost.sh"
 SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main"
 
 GOST_VER="2.12.0"
-SCRIPT_VERSION="1.7"
+SCRIPT_VERSION="1.8"
 BIG_RATE="10000mbit"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -658,20 +656,6 @@ EOF
     log_info "systemd 单元已写入（Type=simple, Restart=always）"
 }
 
-write_logrotate() {
-    cat >"$LOGROTATE_FILE" <<EOF
-$LOG_FILE {
-    daily
-    rotate 7
-    compress
-    missingok
-    notifempty
-    copytruncate
-    create 0640 root root
-}
-EOF
-}
-
 # ---------- 防火墙 ----------
 open_port() {
     local p="$1"
@@ -1193,8 +1177,7 @@ do_install() {
 
     write_gost_conf
     write_unit
-    write_logrotate
-    open_port "$PORT"
+        open_port "$PORT"
     if [[ -n "$old_port" && "$old_port" != "$PORT" ]]; then
         close_port "$old_port"
     fi
@@ -1338,7 +1321,7 @@ do_uninstall() {
     rm -f "$SHAPING_UNIT" "$LIMIT_CONF" "$SHAPING_HELPER"
 
     log_step "删除单元与配置"
-    rm -f "$UNIT" "$GOST_CONF" "$LOGROTATE_FILE"
+    rm -f "$UNIT" "$GOST_CONF"
     systemctl daemon-reload
 
     read -r -p "删除 gost 二进制 $GOST_BIN？[y/N]: " c
@@ -1349,8 +1332,8 @@ do_uninstall() {
         if [[ "${c,,}" == "y" ]]; then close_port "$PORT"; else log_info "防火墙规则已保留"; fi
     fi
 
-    read -r -p "删除日志 $LOG_FILE 与统计数据？[y/N]: " c
-    if [[ "${c,,}" == "y" ]]; then rm -f "$LOG_FILE"; else log_info "日志已保留"; fi
+    log_info "连接日志由 journald 管理，未单独落文件；需要清理可自行执行"
+    log_info "  journalctl --rotate && journalctl --vacuum-time=3d"
 
     read -r -p "删除管理信息与命令 $SELF_PATH？[y/N]: " c
     if [[ "${c,,}" == "y" ]]; then
@@ -1977,8 +1960,7 @@ do_install_cli() {
     [[ -x "$GOST_BIN" ]] || download_gost
     write_gost_conf
     write_unit
-    write_logrotate
-    open_port "$PORT"
+        open_port "$PORT"
     install_self
     write_shaping_unit
     save_install_info

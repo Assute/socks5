@@ -1,74 +1,81 @@
-# socks5
+# sk5
 
-一键搭建 SOCKS5 代理，带交互菜单：**安装 / 修改 / 卸载 / 限速**。
+一键搭建 SOCKS5 代理，带交互菜单：**安装 / 修改 / 卸载 / 限速 / 白名单**。
 
-两个后端，按需选一个：
+后端是 [gost v2](https://github.com/ginuerzh/gost) 2.12.0 —— 单个静态 Go 二进制，不依赖 PAM、不建系统账号，凭据只存在 600 权限的 JSON 里。
 
-| 后端 | 脚本 | 特点 |
-|---|---|---|
-| **gost v2** | `gost.sh` | 单个静态二进制，不依赖 PAM、不建系统账号，凭据只存 600 权限的 JSON。**推荐** |
-| dante | `install.sh` | 系统包管理安装，用户名认证走系统账号 / PAM，依赖多 |
-
-gost 版装的命令是 `sk5`，dante 版装的是 `socks5`。装 gost 版时会把旧的 `socks5` 自动转成指向 `sk5` 的软链，避免新旧副本并存。
-
-## gost 版（推荐）
+## 安装
 
 ```bash
 bash <(curl -fsSL -H 'Accept: application/vnd.github.raw' \
   'https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main')
 ```
 
-> 用 API 而不是 `raw.githubusercontent.com`：后者走 Fastly 缓存，刚发布时可能长期返回旧内容。需要固定版本时用 `https://cdn.jsdelivr.net/gh/Assute/socks5@<commit>/gost.sh`。
+> 用 GitHub API 而不是 `raw.githubusercontent.com`：后者走 Fastly 缓存，刚发布时可能长期返回旧内容。需要固定版本时用 `https://cdn.jsdelivr.net/gh/Assute/socks5@<commit>/gost.sh`。
 
-菜单：
+安装完命令是 **`sk5`**。如果机器上有本脚本旧版装的 `/usr/local/sbin/socks5`，会被自动转成指向 `sk5` 的软链，避免新旧两份副本并存（别人的文件不动）。
+
+## 菜单
 
 ```
 1) 安装 SOCKS5
 2) 修改配置（端口 / 认证）
 3) 卸载
 4) 设置限速
+w) 白名单（只放行指定域名）
 ------------------------------
 5) 查看状态   6) 查看连接信息   7) 重启
-8) 实时日志   9) 自检
-w) 白名单     u) 升级脚本       0) 退出
+8) 实时日志   9) 自检 (doctor)
+u) 升级脚本   0) 退出
 ```
 
-命令行：
+菜单顶部实时显示：脚本版本、服务运行状态、端口、当前限速、白名单状态。
+
+## 命令行
 
 ```bash
 sk5 install --port 8443 --user u1 --pass 'p@ss:w/rd#1'
-sk5 modify | uninstall | limit | status | info | restart | logs
-sk5 allow            # 目标白名单
-sk5 upgrade          # 升级脚本到最新版
-sk5 doctor           # 自检
+sk5 install --no-auth                      # 无认证（仅内网）
+sk5 install --allow '.example.com,1.2.3.4' # 装完即启用白名单
+sk5 modify | uninstall | limit | status | info | restart | logs | stats
+sk5 allow                                  # 白名单管理
+sk5 upgrade                                # 升级脚本
+sk5 doctor                                 # 自检
 sk5 version
+sk5 help
 ```
 
-这套脚本修掉了常见 gost 一键脚本的三个问题：
+## 设计上修掉的几个坑
 
 1. **失效的下载源**：`ghproxy.com` / `mirror.ghproxy.com` 已停用，改用 GitHub 直连 + `ghfast.top` + `gh-proxy.com`，并校验官方 `checksums.txt` 的 sha256，不匹配直接拒绝安装。
 2. **密码泄露**：凭据不写进 systemd 命令行，只放 `/etc/gost/gost.json`（600）。`systemctl cat gost` 看不到密码。
 3. **变量残留**：每次安装都重置凭据状态，不会把上一次的用户名密码带进新配置。
+4. **端口占用**：动手前先检查。占用的若是 dante 版残留，交互模式会直接问你要不要停掉它；非交互模式明确中止且不改动任何文件。
+5. **HTB 丢包**：`tc` 的 `burst` / `cburst` 显式给 32k。不写时内核按速率推算，低速率下可能小于一个 MTU，结果不是限速而是全丢包 —— 症状是「连上后几十秒就超时」。
+6. **service 不重启**：`Restart=always` 而不是 `on-failure`。被外部 SIGKILL 时退出码可能仍为 0，`on-failure` 不会拉起来。
+7. **命令永不更新**：早期版本只在首次安装时写命令文件，之后改仓库无用，副本停在旧版。现在有 `sk5 upgrade`。
 
-凭据含 `@ : / #` 时会自动百分号编码后再写进 gost 的 URL；客户端仍用原始明文密码。
-
-### 升级脚本
+## 升级脚本
 
 ```bash
 sk5 upgrade
 ```
 
-比对磁盘上的版本与远端最新版，只在确实更新时才覆盖 `/usr/local/sbin/sk5`，旧副本留在 `.bak`。菜单按 `u` 同效。
+- 以**磁盘上** `/usr/local/sbin/sk5` 的版本为基准比对（拿运行进程的版本比会永远判「已最新」）
+- 先走 GitHub API，失败回退 raw；两者都校验 shebang 与 `SCRIPT_VERSION`，不合格拒绝替换
+- 逐段数值比较版本，`1.10 > 1.9` 不会被字符串比较判错
+- 只在远端确实更新时才覆盖，旧副本留成 `.bak`；远端更旧不降级，下载失败不动磁盘
 
-**为什么要它**：脚本只在首次安装时写入命令文件，之后不会覆盖已存在的副本 —— 改了仓库却仍在跑旧版就是这个原因。`sk5 version` 会同时打印运行版本与已装命令的版本，不一致时提示升级。
+菜单按 `u` 同效。`sk5 version` 会同时打印**运行版本**与**已装命令的版本**，不一致时提示升级。
 
 ## 目标白名单
 
-只放行你指定的域名/IP，其余目标一律拒绝。菜单里按 `w`，或命令行 `sk5 allow`。
+只放行你指定的域名/IP，其余目标一律拒绝。菜单按 `w`，或命令行 `sk5 allow`。
 
 ```
 1) 查看规则   2) 添加   3) 删除
 4) 清空（放行全部目标）   5) 重新应用
+6) 从日志收集被拒的域名（补规则用）
 ```
 
 规则写在 `/etc/socks5-gost/allow.txt`：
@@ -90,9 +97,9 @@ sk5 upgrade
 | `bypass=~<文件路径>` | ❌ **`~` 被忽略**，变成黑名单 |
 | 文件里写 `reverse true` | ✅ 白名单（唯一正确的文件写法） |
 
-所以 `allow.txt` 里那两行 `reload 10s` / `reverse true` 是开关，不能删。`doctor` 会检查 `reverse` 在不在，缺了会标红。
+所以 `allow.txt` 里的 `reload 10s` / `reverse true` 两行是开关，不能删。`doctor` 会检查 `reverse` 在不在，缺了会标红。
 
-### 匹配深度的限制
+### 匹配深度
 
 gost 只匹配**主域 + 一级子域**：
 
@@ -102,115 +109,61 @@ gost 只匹配**主域 + 一级子域**：
 | `www.example.com` | ✅ |
 | `a.b.example.com` | ❌ 不支持二级 |
 
-`*.example.com` 和 `.example.com` 深度一样，但 `*.` 不匹配主域本身，所以脚本统一把 `*.x` 归一成 `.x`。
+裸域名 `example.com` 是**精确匹配**，`www.example.com` 不放行，所以要覆盖子域必须写点开头的 `.example.com`。`*.x` 与 `.x` 深度相同但 `*.` 不匹配主域本身，脚本统一归一成 `.x`。
 
-## dante 版
+### 补规则：资源被拒时
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Assute/socks5/main/install.sh)
-```
+站点样式丢失、接口 404 这类问题，常见原因是静态资源挂在另一个域名上（CDN / 对象存储 / 第三方库），没列进白名单就被拒。
 
-拿到菜单后选序号即可。装完会注册一个 `sk5` 命令，以后再管理直接敲：
-
-```bash
-socks5
-```
-
-## 菜单
+菜单 `w → 6` 会从日志里回收被拒的域名：
 
 ```
-1) 安装 SOCKS5 服务
-2) 修改配置（端口 / 认证 / 重配）
-3) 卸载 SOCKS5 服务
-4) 设置限速
-------------------------------
-5) 查看状态
-6) 查看连接信息
-7) 重启服务
-8) 实时日志
-9) 操作统计
-u) 升级脚本
-0) 退出
+最近 2 hours ago 被拒绝的域名（已排除纯 IP）
+   1) cdn.jsdelivr.net
+   2) fonts.googleapis.com
+把上面 2 个域名加入白名单？[y/N]:
 ```
 
-菜单顶部实时显示：脚本版本、服务运行状态、端口、当前限速值。
+已被现有规则覆盖的会自动跳过。
 
-## 升级
-
-```bash
-socks5 upgrade
-```
-
-拉取最新脚本，比对版本，确认后覆盖 `/usr/local/sbin/socks5`，旧版留一份 `.bak`。
-
-**换脚本不等于换配置。** 新版可能改过 `danted.conf` 或 systemd 单元的生成逻辑，所以升级后会问你要不要重建一遍：
-
-```
-同时用新版本重建服务配置（danted.conf + systemd 单元）并重启？[Y/n]:
-```
-
-选是就会用新脚本重新生成配置、校验、重启。这一步是用**新脚本**执行的（`exec`），不是拿当前进程里的旧函数去写 —— 否则只会把旧格式再写一遍。
-
-也可以单独重建，不升级：
-
-```bash
-socks5 refresh
-```
-
-改动过脚本或怀疑配置和版本对不上时，跑这个即可。
-
-拉取走 GitHub API 而不是 `raw.githubusercontent.com`：后者走 Fastly 缓存，刚发布时通常还拿到旧内容。API 失败才退回 raw，并在版本倒退时明确告警。
-
-查版本：
-
-```bash
-socks5 version
-```
-
-会同时打印**正在运行的版本**、**已安装命令的版本**、**安装记录里的版本**，三者不一致一眼可见。
+> `curl` 返回 `(97)` 只代表代理层失败，**无法区分**「被白名单拒绝」与「目标域名解析不了」—— 两者都是 97。要确认得看日志里的 `Bypass` 行（`w → 6` 就是在解析它）。
 
 ## 自检
 
-出问题时先跑这个，比逐个猜快得多：
-
 ```bash
-socks5 doctor
+sk5 doctor
 ```
 
 ```
 [脚本]
-  运行位置: /usr/local/sbin/socks5
-  运行版本: v3.7
+  运行位置: /usr/local/sbin/sk5
+  运行版本: v1.8
   语法自检: OK
-  已装命令: /usr/local/sbin/socks5 (v3.7)
-  安装记录: v3.7
+  已装命令: /usr/local/sbin/sk5（v1.8）
 
-[服务]
-  danted:   OK 运行中
-  unit:     Type=simple KillMode=mixed PIDFile=0
-  单元格式: OK
+[程序与服务]
+  gost:     gost v2.12.0
+  服务:     OK 运行中
+  启动于:   ... （已运行 358 秒）
+  重启次数: 0
 
-[配置]
-  /etc/danted.conf: 42 行
-  配置校验: OK
-  监听地址: 0.0.0.0 port = 3030
-  出口网卡: eth0
-
-[端口与限速]
-  SOCKS 端口: 3030
-  监听状态: OK
-  限速: 下载 2mbit / 上传 2mbit
+[配置]        gost.json 权限、unit 的 Type/Restart、凭据是否在命令行里
+[端口与可达性] 监听状态、绑定地址、本机探测、公网探测
+[目标白名单]  规则清单、reverse 是否在
+[滥用风险]    认证状态、当前连接数、近 10 分钟客户端 IP 数
+[防火墙]      ufw / firewalld / iptables 放行情况
 ```
 
-任何一项是 `FAIL` 或「旧格式」，下面该跑什么就清楚了。
+两个关键读法：
 
-> 版本号的一个坑：早期版本把脚本版本也存在 `install_info.conf` 里并用了 `SCRIPT_VERSION` 这个键名，`source` 该文件时会覆盖掉运行中的 `$SCRIPT_VERSION`，导致菜单、升级比较、refresh 全部报错版本号（代码是新的，显示是旧的）。v3.7 起记录键改名为 `MANAGER_VERSION`，且 `load_install_info` 会保护运行版本不被污染。
+- **`启动于` 很短 + `重启次数` 一直涨** → 进程在反复退出（被外部杀 / OOM）
+- **服务运行中但 `公网探测` FAIL，而 `本机探测` OK** → 云安全组没放行，跟代理无关
 
 ## 限速
 
-dante 本身不支持限速，这里用 Linux `tc` 的 HTB 队列在网卡层整形。
+gost 本身不限制带宽，用 Linux `tc` 的 HTB 队列在网卡层整形。
 
-**关键设计：只匹配 SOCKS 端口，不整形整块网卡。** 直接对网卡限速会连 SSH 一起限，几千块的带宽一开，自己先掉线。
+**关键设计：只匹配 SOCKS 端口，不整形整块网卡。** 直接对网卡限速会连 SSH 一起限。
 
 | 方向 | 匹配条件 | 含义 |
 |---|---|---|
@@ -223,104 +176,124 @@ dante 本身不支持限速，这里用 Linux `tc` 的 HTB 队列在网卡层整
 
 单位写法：`10` = 10 Mbps，`800K` = 800 Kbps，`0` = 不限。
 
-设置结果落在 `/etc/socks5-manager/limit.conf`，并由 `socks5-shaping.service` 开机自动恢复（服务文件调用自包含的 `/usr/local/sbin/socks5-shaping`，不依赖管理脚本放在哪）。
+设置落在 `/etc/socks5-gost/limit.conf`，由 `gost-shaping.service` 开机自动恢复（调用自包含的 `/usr/local/sbin/gost-shaping`，不依赖管理脚本放在哪）。
 
-## 命令行
+排查限速是否在丢包：
 
 ```bash
-socks5 install                          # 交互安装
-socks5 install --port 1080 \
-               --user Admin01 --pass 'p@ss:w/rd#1'   # 非交互安装
-socks5 install --no-auth                 # 无认证（慎用）
-socks5 modify                            # 改端口 / 改密码 / 换认证模式
-socks5 limit                             # 限速菜单
-socks5 status | info | restart | logs | stats
-socks5 upgrade                           # 检查并升级脚本
-socks5 refresh                           # 按安装记录重建配置并重启
-socks5 version                           # 查版本（含已安装命令的版本）
-socks5 doctor                            # 自检：脚本/服务/配置/限速一次列清
-socks5 uninstall
+IFC=$(ip -4 route show default | awk '{print $5; exit}')
+tc -s class show dev "$IFC"    # 看 1:10 那行的 dropped
 ```
+
+`dropped` 持续增长 = 队列在丢包，把速率调大或检查 `burst`。
 
 ## 文件位置
 
 | 路径 | 作用 |
 |---|---|
-| `/etc/danted.conf` | Dante 配置，改动前自动备份为 `.bak.<时间戳>` |
-| `/etc/systemd/system/danted.service` | 服务单元 |
-| `/etc/socks5-manager/install_info.conf` | 安装信息（含密码，权限 600） |
-| `/etc/socks5-manager/limit.conf` | 限速配置 |
-| `/etc/socks5-manager/usage_stats.log` | 操作历史 |
-| `/usr/local/sbin/socks5` | 管理命令 |
-| `/usr/local/sbin/socks5-shaping` | 限速应用脚本（systemd 调用） |
-| `/etc/logrotate.d/socks5-danted` | 日志轮转，保留 7 天 |
-| `/var/log/danted.log` | 连接日志 |
+| `/usr/local/bin/gost` | gost 二进制 |
+| `/etc/gost/gost.json` | 服务配置（含凭据，权限 600） |
+| `/etc/systemd/system/gost.service` | 服务单元 |
+| `/usr/local/sbin/sk5` | 管理命令 |
+| `/etc/socks5-gost/install.conf` | 安装信息（含密码，权限 600） |
+| `/etc/socks5-gost/limit.conf` | 限速配置 |
+| `/etc/socks5-gost/allow.txt` | 目标白名单 |
+| `/etc/socks5-gost/usage.log` | 操作历史 |
+| `/usr/local/sbin/gost-shaping` | 限速应用脚本（systemd 调用） |
+| `/etc/systemd/system/gost-shaping.service` | 限速开机恢复 |
+
+连接日志由 journald 管理，没有单独落文件。
 
 ## 用户名和密码
 
-用户名和密码都可以随意设，脚本不限制字符集和复杂度：
+用户名和密码都可以随意设，**中英文、空格、符号都行**：
 
-- **用户名**：大写、数字开头、点、`@`、`#` 都行，最长 32 位。只挡三个会真正坏事的字符 —— 冒号（会破坏 `chpasswd` 的 `user:pass` 行格式）、空格、以及 `-` 开头。
-- **密码**：1–64 位任意字符，包括 `@ : / # ? % 空格`。留空自动生成 16 位随机串。
+- **用户名**：1–64 位，非空
+- **密码**：1–128 位；留空自动生成 16 位随机串
 
-唯一的外部限制来自系统：dante 的用户名认证走 PAM，**用户名必须对应一个真实的 Linux 账号**。`useradd` 默认会拒掉大写开头、数字开头的名字，脚本会自动加 `--badname` 重试；如果系统仍然拒绝，会打印 `useradd` 的原始报错。
+只挡三样：空值、超长、控制字符（换行 / 制表符 —— 会破坏配置文件的 `KEY=VALUE` 格式）。
 
-密码写入时如果被 `pam_pwquality` 之类按复杂度挡下，脚本会绕开 PAM 直接写 SHA-512 哈希，所以 `123` 这种密码也能设成功。
+gost 的凭据放在 URL 里（`socks5://user:pass@:port`），所以脚本会先做百分号编码再写入，`@ : / # ? %` 都不会破坏结构：
 
-因为密码可能有特殊字符，客户端命令一律用 `--proxy-user` 传凭据，不走 `user:pass@host` 的 URL 形式：
+```json
+{"ServeNodes":["socks5://%E5%BC%A0%E4%B8%89:%E5%AF%86%E7%A0%81%20abc@:8443"]}
+```
+
+**客户端用原始明文**，不用管编码。因为密码可能有特殊字符，客户端命令一律用 `--proxy-user` 传凭据，不走 `user:pass@host` 的 URL 形式：
 
 ```bash
-curl --socks5-hostname 服务器IP:1080 --proxy-user '用户名:密码' https://api.ipify.org
+curl --socks5-hostname 服务器IP:8443 --proxy-user '张三:密码 abc' https://api.ipify.org
 ```
 
 ## 客户端
 
-浏览器填 SOCKS5 主机 + 端口，**务必勾选「代理解析域名」/「远程 DNS」**，否则 DNS 泄漏。
-
-curl 验证：
-
-```bash
-curl --socks5-hostname 服务器IP:1080 --proxy-user '用户名:密码' https://api.ipify.org
-```
+浏览器填 SOCKS5 主机 + 端口，**务必勾选「代理解析域名」/「远程 DNS」**，否则 DNS 泄漏，且白名单也管不住域名解析。
 
 返回服务器的出口 IP 即成功。
+
+> 启用白名单后，客户端自带的「节点测速 / 延迟测试」通常会失败 —— 它测的是厂商固定的测试地址，不在你的列表里。这不代表节点有问题。
 
 ## 排查
 
 ```bash
-systemctl status danted            # 服务状态
-journalctl -u danted -n 50         # 启动报错
-tail -f /var/log/danted.log        # 连接日志
-danted -V -f /etc/danted.conf      # 配置校验（大写 V；小写 v 只打印版本号）
-tc -s class show dev eth0          # 限速是否命中（看 Sent 字节数）
-iptables -S INPUT | grep 1080      # 防火墙规则
+systemctl status gost                # 服务状态
+journalctl -u gost -n 50             # 最近日志
+journalctl -u gost -f                # 实时
+sk5 doctor                           # 一次列清
 ```
 
-改完 `danted.conf` 记得 `systemctl restart danted`。
+gost 日志格式：`<->` 表示连接建立，`>-<` 表示关闭，`: Bypass <域名>` 表示被白名单拒绝。
 
-### 启动超时 / 起不来
-
-dante 的几个行为容易踩：不给 `-D` 时它在前台运行、不 fork；pid 文件要 `-p` 显式指定才会生成。所以 unit 必须用 `Type=simple` 托管前台进程，写 `Type=forking` + `PIDFile=` 会卡满 90 秒然后被杀。脚本生成的 unit 已经是正确的，如果手工改过，对照检查：
-
-```bash
-systemctl cat danted | grep -E 'Type=|PIDFile|KillMode'
-# 期望：Type=simple，没有 PIDFile，KillMode=mixed
+```
+[socks5] 1.1.1.1:52733 -> socks5://:3030 -> example.com:443
+[socks5] 1.1.1.1:52733 <-> example.com:443      ← 建立
+[socks5] 1.1.1.1:52733 >-< example.com:443      ← 关闭
+[socks5] 1.1.1.1:52733 - 1.1.1.1:3030 : Bypass other.com:443   ← 被白名单拒
 ```
 
-danted 会派生一组子进程，残留下来会占着端口导致下次启动 `Address already in use`：
+### 端口被占用
+
+```
+[ERROR] 端口 3030 已被占用：
+  LISTEN 0 511 0.0.0.0:3030 ... users:(("danted",pid=3577890,fd=9))
+```
+
+如果占用者是旧版 dante，交互安装会问你要不要停掉；手工处理：
 
 ```bash
-systemctl stop danted; systemctl reset-failed danted
+systemctl disable --now danted socks5-shaping 2>/dev/null
 pkill -9 -x danted
-rm -f /run/danted.pid
-ss -ltnp | grep 1080        # 确认端口已释放
-socks5 restart
+ss -ltnp | grep -w 3030        # 必须没有输出
+systemctl reset-failed gost
+sk5 restart
+```
+
+`pkill -9` 不能省 —— `systemctl stop` 经常杀不干净 dante 派生的子进程，残留会一直占着端口。
+
+### 服务起不来
+
+```bash
+sk5 doctor                    # 先看这一段
+systemctl cat gost | grep -E 'Type=|Restart=|ExecStart'
+# 期望：Type=simple，Restart=always，ExecStart 里是 -C 配置文件而不是明文密码
 ```
 
 ## 安全
 
-无认证模式下，任何知道 `IP:端口` 的人都能拿它当出口，带宽和风险都是你的。建议：
+- **默认启用用户名密码认证**。无认证代理一旦公网可达，通常几分钟内就被扫描器收录，流量算在你头上。
+- **不要用弱密码**。公网端口每天都有爆破，`123456` 这种几分钟就进。
+- **白名单是最有效的一道限制**：只放行你真正要用的目标，别人拿到凭据也当不了通用出口。
+- **只对固定 IP 开放**更彻底：
 
-- 默认用用户名密码认证（脚本默认选项）
-- 只对固定 IP 开放：`iptables -A INPUT -p tcp --dport 1080 -s 你的IP -j ACCEPT`
-- 或在 `danted.conf` 的 `client pass` 里把 `from: 0.0.0.0/0` 改成你的网段
+```bash
+iptables -I INPUT -p tcp --dport 8443 -s 你的IP -j ACCEPT
+iptables -A INPUT -p tcp --dport 8443 -j DROP
+```
+
+- 云主机还要在控制台的安全组里放行入方向 TCP 端口。
+
+### 一个必须说清的局限
+
+**SOCKS5 是明文协议，不能对抗链路审查。** 客户端发出的 `CONNECT 域名` 和 TLS 的 SNI 都是明文，中间设备能直接看到你在访问什么。用它访问被针对性阻断的站点时，可能触发对该服务器 IP:端口 的封锁 —— 表现为「一开始能用，访问某个站点后就整个连不上了」。
+
+白名单解决的是「别人拿你的代理当通用梯子」，不解决这个问题。需要访问被审查的目标，要换加密且抗识别的协议（如 VLESS + Reality、Hysteria2、Trojan），或临时用 `ssh -D` 这类全程加密的通道。
