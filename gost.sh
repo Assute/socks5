@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 管理脚本 v1.3   (gost v2 后端)
+#  SOCKS5 管理脚本 v1.4   (gost v2 后端)
 #
 #  系统: Debian / Ubuntu / CentOS / Rocky / Alma / RHEL (systemd)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc) · 状态 · 自检 · 升级
@@ -36,7 +36,7 @@ SELF_URL="https://raw.githubusercontent.com/Assute/socks5/main/gost.sh"
 SELF_API_URL="https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main"
 
 GOST_VER="2.12.0"
-SCRIPT_VERSION="1.3"
+SCRIPT_VERSION="1.4"
 BIG_RATE="10000mbit"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -379,7 +379,16 @@ do_allow() {
 apply_allow() {
     write_gost_conf
     if gost_running; then
-        restart_gost && log_success "已应用，白名单: $(allow_status_text)"
+        restart_gost && {
+            log_success "已应用，白名单: $(allow_status_text)"
+            if allow_enabled; then
+                echo
+                log_warn "注意：现在只有下列目标能被访问，其余一律被拒绝"
+                log_warn "客户端的「节点测速 / 延迟测试」会失败 —— 它测的是自己的测试地址，"
+                log_warn "不在你的列表里就会显示节点不可用，这不代表服务有问题"
+                test_whitelist
+            fi
+        }
     else
         log_info "配置已更新，服务未运行，下次启动生效"
     fi
@@ -872,29 +881,75 @@ restart_gost() {
 }
 
 # ---------- 测试 ----------
+# 取一条白名单里的域名规则，用于测试；优先取域名而不是 IP/网段
+allow_first_domain() {
+    allow_rules 2>/dev/null | grep -E '^\.?[A-Za-z0-9*-]+\.[A-Za-z]' | head -n1 \
+        | sed 's/^\.//; s/^\*\.//'
+}
+
+# 白名单自检：挑一条列表内的域名应放行，一个必定不在列表里的域名应被拒
+test_whitelist() {
+    allow_enabled || return 0
+    has_cmd curl || return 0
+    local dom rc_a rc_d
+    dom=$(allow_first_domain)
+    log_info "白名单自检（共 $(allow_count) 条规则）"
+
+    if [[ -n "$dom" ]]; then
+        local ua=()
+        [[ "$USE_AUTH" == true ]] && ua=(--proxy-user "${USER_NAME}:${PASS_WORD}")
+        timeout 12 curl -s -o /dev/null --socks5-hostname "127.0.0.1:${PORT}" \
+            "${ua[@]}" "https://${dom}" >/dev/null 2>&1
+        rc_a=$?
+        # 97 = 被代理拒绝；只要不是 97，就说明 ACL 放行了
+        if [[ $rc_a -eq 97 ]]; then
+            log_error "白名单异常：列表内的 ${dom} 反而被拒绝（rc=97）"
+            log_error "  检查 $ALLOW_FILE 是否缺少 reverse true"
+        else
+            log_success "放行正常: ${dom}（rc=$rc_a，非 97 即 ACL 已放行）"
+        fi
+    fi
+
+    local probe="whitelist-probe-$RANDOM.invalid"
+    timeout 12 curl -s -o /dev/null --socks5-hostname "127.0.0.1:${PORT}" \
+        --proxy-user "${USER_NAME}:${PASS_WORD}" "https://${probe}" >/dev/null 2>&1
+    rc_d=$?
+    if [[ $rc_d -eq 97 ]]; then
+        log_success "拒绝正常: 列表外目标被拦截"
+    else
+        log_warn "列表外目标未被拒绝（rc=$rc_d）—— 白名单可能没生效"
+    fi
+}
+
 test_proxy() {
     local rc=0
     port_listening "$PORT" || { log_error "端口 $PORT 未监听"; return 1; }
     log_success "端口 $PORT 正在监听"
 
     if has_cmd curl; then
-        if [[ "$USE_AUTH" == true ]]; then
-            # 一律用 --proxy-user：拼进 URL 的话 @ : / 会破坏结构，
-            # 而 gost 配置里存的是百分号编码后的值，客户端必须用原始明文
-            timeout 15 curl -s --socks5-hostname "127.0.0.1:${PORT}" \
-                --proxy-user "${USER_NAME}:${PASS_WORD}" http://api.ipify.org >/dev/null 2>&1
+        if allow_enabled; then
+            # 白名单开了就不能拿 api.ipify.org 测了 —— 它多半不在列表里，
+            # 被拒会造成"服务坏了"的误判。改为白名单自检。
+            test_whitelist
         else
-            timeout 15 curl -s --socks5-hostname "127.0.0.1:${PORT}" \
-                http://api.ipify.org >/dev/null 2>&1
+            if [[ "$USE_AUTH" == true ]]; then
+                # 一律用 --proxy-user：拼进 URL 的话 @ : / 会破坏结构，
+                # 而 gost 配置里存的是百分号编码后的值，客户端必须用原始明文
+                timeout 15 curl -s --socks5-hostname "127.0.0.1:${PORT}" \
+                    --proxy-user "${USER_NAME}:${PASS_WORD}" http://api.ipify.org >/dev/null 2>&1
+            else
+                timeout 15 curl -s --socks5-hostname "127.0.0.1:${PORT}" \
+                    http://api.ipify.org >/dev/null 2>&1
+            fi
+            rc=$?
+            case $rc in
+                0) log_success "本机经代理出网正常" ;;
+                5|6) log_error "认证失败（rc=$rc），检查用户名密码" ;;
+                7)  log_error "本机连不上端口（rc=7），服务没在监听" ;;
+                28) log_error "代理出网超时（rc=28）：能进代理，但代理连不到目标" ;;
+                *)  log_warn "本机经代理出网未通过（rc=$rc）" ;;
+            esac
         fi
-        rc=$?
-        case $rc in
-            0) log_success "本机经代理出网正常" ;;
-            5|6) log_error "认证失败（rc=$rc），检查用户名密码" ;;
-            7)  log_error "本机连不上端口（rc=7），服务没在监听" ;;
-            28) log_error "代理出网超时（rc=28）：能进代理，但代理连不到目标" ;;
-            *)  log_warn "本机经代理出网未通过（rc=$rc）" ;;
-        esac
     else
         log_info "curl 未安装，跳过出网测试"
     fi
