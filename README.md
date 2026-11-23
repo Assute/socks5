@@ -1,10 +1,55 @@
 # socks5
 
-一键搭建 Dante SOCKS5 代理，带交互菜单：**安装 / 修改 / 卸载 / 限速**。
+一键搭建 SOCKS5 代理，带交互菜单：**安装 / 修改 / 卸载 / 限速**。
 
-支持 Debian、Ubuntu、CentOS、Rocky、Alma、RHEL。
+两个后端，按需选一个：
 
-## 安装
+| 后端 | 脚本 | 特点 |
+|---|---|---|
+| **gost v2** | `gost.sh` | 单个静态二进制，不依赖 PAM、不建系统账号，凭据只存 600 权限的 JSON。**推荐** |
+| dante | `install.sh` | 系统包管理安装，用户名认证走系统账号 / PAM，依赖多 |
+
+两个脚本装的命令都叫 `socks5`，别同时用；切换前先卸载旧的。
+
+## gost 版（推荐）
+
+```bash
+bash <(curl -fsSL -H 'Accept: application/vnd.github.raw' \
+  'https://api.github.com/repos/Assute/socks5/contents/gost.sh?ref=main')
+```
+
+> 用 API 而不是 `raw.githubusercontent.com`：后者走 Fastly 缓存，刚发布时可能长期返回旧内容。需要固定版本时用 `https://cdn.jsdelivr.net/gh/Assute/socks5@<commit>/gost.sh`。
+
+菜单：
+
+```
+1) 安装 SOCKS5
+2) 修改配置（端口 / 认证）
+3) 卸载
+4) 设置限速
+------------------------------
+5) 查看状态   6) 查看连接信息   7) 重启
+8) 实时日志   9) 自检           0) 退出
+```
+
+命令行：
+
+```bash
+socks5 install --port 8443 --user u1 --pass 'p@ss:w/rd#1'
+socks5 modify | uninstall | limit | status | info | restart | logs
+socks5 doctor        # 自检
+socks5 version
+```
+
+这套脚本修掉了常见 gost 一键脚本的三个问题：
+
+1. **失效的下载源**：`ghproxy.com` / `mirror.ghproxy.com` 已停用，改用 GitHub 直连 + `ghfast.top` + `gh-proxy.com`，并校验官方 `checksums.txt` 的 sha256，不匹配直接拒绝安装。
+2. **密码泄露**：凭据不写进 systemd 命令行，只放 `/etc/gost/gost.json`（600）。`systemctl cat gost` 看不到密码。
+3. **变量残留**：每次安装都重置凭据状态，不会把上一次的用户名密码带进新配置。
+
+凭据含 `@ : / #` 时会自动百分号编码后再写进 gost 的 URL；客户端仍用原始明文密码。
+
+## dante 版
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Assute/socks5/main/install.sh)
