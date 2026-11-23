@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SOCKS5 服务管理脚本 v3.0   (Dante SOCKS5)
+#  SOCKS5 服务管理脚本 v3.1   (Dante SOCKS5)
 #
 #  系统: Debian / Ubuntu (apt)   CentOS / Rocky / Alma / RHEL (dnf|yum)
 #  功能: 安装 · 修改 · 卸载 · 限速(tc HTB) · 状态 · 日志 · 统计
@@ -23,7 +23,7 @@ SELF_PATH="/usr/local/sbin/socks5"
 LOG_FILE="/var/log/danted.log"
 LOGROTATE_FILE="/etc/logrotate.d/socks5-danted"
 IFB_DEV="ifb0"
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="3.1"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'
@@ -417,26 +417,36 @@ create_system_user() {
     if id "$SOCKS_USER" >/dev/null 2>&1; then
         log_warn "用户 $SOCKS_USER 已存在，直接重置密码"
     else
-        local shell_bin=/usr/sbin/nologin
+        local shell_bin=/usr/sbin/nologin err=""
         [[ -x /sbin/nologin ]] && shell_bin=/sbin/nologin
-        useradd -r -M -s "$shell_bin" "$SOCKS_USER" 2>/dev/null \
-            || useradd -M -s "$shell_bin" "$SOCKS_USER" \
-            || die "创建用户失败"
+        # 先按系统默认策略建；被拒则用 --badname 跳过用户名正则
+        # （大写开头、数字开头这类名字 useradd 默认不收，但内核和 PAM 本身无所谓）
+        if ! err=$(useradd -r -M -s "$shell_bin" "$SOCKS_USER" 2>&1); then
+            log_warn "useradd 默认策略拒绝该用户名，改用 --badname 重试"
+            if ! err=$(useradd -r -M -s "$shell_bin" --badname "$SOCKS_USER" 2>&1); then
+                if ! err=$(useradd -M -s "$shell_bin" --badname "$SOCKS_USER" 2>&1); then
+                    log_error "系统拒绝创建用户 [$SOCKS_USER]：$err"
+                    log_error "dante 的用户名认证依赖真实系统账号，换一个用户名再试"
+                    return 1
+                fi
+            fi
+        fi
         log_info "用户 $SOCKS_USER 已创建"
     fi
 
     # chpasswd 失败时用 openssl 直写 shadow 哈希
     if ! printf '%s:%s\n' "$SOCKS_USER" "$SOCKS_PASS" | chpasswd 2>/dev/null; then
+        # 部分系统的 chpasswd 会经 pam_pwquality 拒绝简单口令，直写哈希绕过
+        local h=""
         if has_cmd openssl; then
-            local h
-            h=$(openssl passwd -6 "$SOCKS_PASS" 2>/dev/null)
-            if [[ -n "$h" ]]; then
-                usermod -p "$h" "$SOCKS_USER" && log_info "密码已写入（openssl 回退）"
-            else
-                die "设置密码失败"
-            fi
+            h=$(printf '%s' "$SOCKS_PASS" | openssl passwd -6 -stdin 2>/dev/null)
+        fi
+        if [[ -n "$h" ]]; then
+            usermod -p "$h" "$SOCKS_USER" || { log_error "写入密码失败"; return 1; }
+            log_info "密码已写入（绕过 PAM 复杂度校验）"
         else
-            die "设置密码失败（chpasswd 与 openssl 均不可用）"
+            log_error "设置密码失败：chpasswd 与 openssl 均不可用"
+            return 1
         fi
     else
         log_info "用户密码已设置"
@@ -446,6 +456,7 @@ create_system_user() {
     chage -E -1 -M 99999 "$SOCKS_USER" 2>/dev/null
 
     ensure_pam_service
+    return 0
 }
 
 write_danted_conf() {
@@ -650,8 +661,41 @@ ask_port() {
     done
 }
 
+# ---------- 凭据规则 ----------
+# 用户名只挡三类真正会坏事的字符：
+#   :   —— 会破坏 chpasswd 的 "user:pass" 行格式
+#   空格 —— 会破坏命令行与配置引用
+#   - 开头 —— 会被当成命令选项
+# 大小写、数字开头、点、@、# 等全部放行；真正的上限来自系统的 useradd
+valid_user_name() {
+    local v="$1"
+    [[ -z "$v" ]] && return 1
+    [[ ${#v} -gt 32 ]] && return 1
+    [[ "$v" == *:* ]] && return 1
+    [[ "$v" == *[[:space:]]* ]] && return 1
+    [[ "$v" == -* ]] && return 1
+    return 0
+}
+
+# 密码除长度外不设限
+valid_password() {
+    [[ ${#1} -ge 1 && ${#1} -le 64 ]]
+}
+
+# 生成客户端命令。凭据走 --proxy-user 传，绕开 URL 解析，
+# 所以密码里带 @ : / # ? % 这些字符也不用手动转义
+curl_hint() {
+    local host="$1" port="$2"
+    if [[ "$USE_AUTH" == true ]]; then
+        printf 'curl --socks5-hostname %s:%s --proxy-user %s https://api.ipify.org' \
+            "$host" "$port" "$(printf '%q' "${SOCKS_USER}:${SOCKS_PASS}")"
+    else
+        printf 'curl --socks5-hostname %s:%s https://api.ipify.org' "$host" "$port"
+    fi
+}
+
 ask_auth() {
-    local m
+    local m u p
     echo
     echo -e "${YELLOW}认证方式：${NC}"
     echo "  1) 用户名密码认证  (推荐)"
@@ -669,21 +713,25 @@ ask_auth() {
     fi
 
     USE_AUTH=true
-    local u p
-    read -r -p "用户名 [默认 socksuser]: " u
-    SOCKS_USER="${u:-socksuser}"
-    if ! [[ "$SOCKS_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-        log_error "用户名只能是小写字母/数字/下划线，且不以数字开头"
-        ask_auth; return
-    fi
+
     while true; do
-        read -r -s -p "密码 [留空自动生成 16 位]: " p
-        echo
-        [[ -z "$p" ]] && { p=$(gen_pass); log_info "已自动生成密码: $p"; }
-        [[ ${#p} -lt 6 ]] && { log_error "密码至少 6 位"; continue; }
-        SOCKS_PASS="$p"
-        break
+        read -r -p "用户名 [默认 socksuser，大小写随意]: " u
+        SOCKS_USER="${u:-socksuser}"
+        valid_user_name "$SOCKS_USER" && break
+        log_error "用户名被拒：不能为空、不能超过 32 位、不能含冒号或空格、不能以 - 开头"
     done
+
+    while true; do
+        IFS= read -r -s -p "密码 [留空自动生成 16 位，字符不限]: " p
+        echo
+        if [[ -z "$p" ]]; then
+            p=$(gen_pass)
+            log_info "已自动生成密码: $p"
+        fi
+        valid_password "$p" && { SOCKS_PASS="$p"; break; }
+        log_error "密码最长 64 位"
+    done
+    return 0
 }
 
 # ---------- 连接测试 ----------
@@ -701,7 +749,9 @@ test_proxy() {
     has_cmd curl || { log_info "curl 未安装，跳过连通性测试"; return 0; }
 
     if [[ "$USE_AUTH" == true ]]; then
-        timeout 12 curl -s --socks5-hostname "${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${SOCKS_PORT}" \
+        # 凭据用 --proxy-user 传，避免密码里的 @ : / 等字符被当成 URL 的一部分
+        timeout 12 curl -s --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
+            --proxy-user "${SOCKS_USER}:${SOCKS_PASS}" \
             http://api.ipify.org >/dev/null 2>&1
         rc=$?
     else
@@ -808,10 +858,10 @@ show_install_complete() {
         echo -e "认证:     ${GREEN}用户名密码${NC}"
         echo -e "用户名:   ${GREEN}${SOCKS_USER}${NC}"
         echo -e "密码:     ${GREEN}${SOCKS_PASS}${NC}"
-        echo -e "测试:     ${YELLOW}curl --socks5-hostname ${SOCKS_USER}:${SOCKS_PASS}@${SERVER_IP}:${SOCKS_PORT} http://api.ipify.org${NC}"
+        echo -e "测试:     ${YELLOW}$(curl_hint "$SERVER_IP" "$SOCKS_PORT")${NC}"
     else
         echo -e "认证:     ${RED}无认证${NC}"
-        echo -e "测试:     ${YELLOW}curl --socks5-hostname ${SERVER_IP}:${SOCKS_PORT} http://api.ipify.org${NC}"
+        echo -e "测试:     ${YELLOW}$(curl_hint "$SERVER_IP" "$SOCKS_PORT")${NC}"
         echo -e "${RED}注意: 无认证状态下任何知道 IP:端口 的人都能用你的带宽${NC}"
     fi
     echo
@@ -867,7 +917,7 @@ do_modify() {
             ;;
         2)
             ask_auth
-            create_system_user
+            create_system_user || { log_error "认证用户创建失败，配置未改动"; return 1; }
             write_danted_conf
             save_install_info
             if restart_dante; then log_success "认证信息已更新"; fi
@@ -881,7 +931,8 @@ do_modify() {
             else
                 echo -n "确认开启用户名密码认证？[y/N]: "; read -r c
                 [[ "${c,,}" != "y" ]] && { log_info "已取消"; return 0; }
-                ask_auth; create_system_user
+                ask_auth
+                create_system_user || { log_error "认证用户创建失败，认证模式未改动"; return 1; }
             fi
             write_danted_conf
             save_install_info
@@ -891,7 +942,7 @@ do_modify() {
             local old4="$SOCKS_PORT"
             ask_port "$old4"
             ask_auth
-            create_system_user
+            create_system_user || { log_error "认证用户创建失败，配置未改动"; return 1; }
             if [[ "$SOCKS_PORT" != "$old4" ]]; then
                 retune_port "$old4" "$SOCKS_PORT" \
                     && log_success "配置已更新（端口 $SOCKS_PORT）" \
@@ -1239,11 +1290,7 @@ show_info() {
     fi
     echo
     echo -e "${CYAN}客户端示例${NC}"
-    if [[ "$USE_AUTH" == true ]]; then
-        echo "  curl:  curl --socks5-hostname ${SOCKS_USER}:${SOCKS_PASS}@${SERVER_IP}:${SOCKS_PORT} https://api.ipify.org"
-    else
-        echo "  curl:  curl --socks5-hostname ${SERVER_IP}:${SOCKS_PORT} https://api.ipify.org"
-    fi
+    echo "  curl:  $(curl_hint "$SERVER_IP" "$SOCKS_PORT")"
     echo "  浏览器: SOCKS5  ${SERVER_IP}  ${SOCKS_PORT}  （勾选「代理解析域名 / 远程 DNS」）"
     log_usage "info viewed"
 }
@@ -1361,8 +1408,8 @@ SOCKS5 管理脚本 v${SCRIPT_VERSION}
 
 install 的非交互选项:
   --port N               SOCKS 端口
-  --user NAME            认证用户名
-  --pass PASS            认证密码
+  --user NAME            认证用户名（大小写随意，最长 32 位）
+  --pass PASS            认证密码（1-64 位，字符不限）
   --no-auth              无认证模式（慎用）
 
 示例:
@@ -1402,7 +1449,11 @@ do_install_noninteractive() {
 
     echo
     log_info "端口=$SOCKS_PORT  认证=$USE_AUTH  用户=${SOCKS_USER:-无}"
-    create_system_user
+    if [[ "$USE_AUTH" == true ]]; then
+        valid_user_name "$SOCKS_USER" || die "用户名被拒：不能为空、不能超过 32 位、不能含冒号或空格、不能以 - 开头"
+        valid_password "$SOCKS_PASS" || die "密码最长 64 位"
+    fi
+    create_system_user || die "认证用户创建失败"
     write_danted_conf
     "$DANTE_BIN" -v -f "$DANTE_CONF" >/dev/null 2>&1 || die "配置校验失败"
     write_systemd_unit

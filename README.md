@@ -58,7 +58,7 @@ dante 本身不支持限速，这里用 Linux `tc` 的 HTB 队列在网卡层整
 ```bash
 socks5 install                          # 交互安装
 socks5 install --port 1080 \
-               --user u1 --pass 'p@ss'   # 非交互安装
+               --user Admin01 --pass 'p@ss:w/rd#1'   # 非交互安装
 socks5 install --no-auth                 # 无认证（慎用）
 socks5 modify                            # 改端口 / 改密码 / 换认证模式
 socks5 limit                             # 限速菜单
@@ -80,6 +80,23 @@ socks5 uninstall
 | `/etc/logrotate.d/socks5-danted` | 日志轮转，保留 7 天 |
 | `/var/log/danted.log` | 连接日志 |
 
+## 用户名和密码
+
+用户名和密码都可以随意设，脚本不限制字符集和复杂度：
+
+- **用户名**：大写、数字开头、点、`@`、`#` 都行，最长 32 位。只挡三个会真正坏事的字符 —— 冒号（会破坏 `chpasswd` 的 `user:pass` 行格式）、空格、以及 `-` 开头。
+- **密码**：1–64 位任意字符，包括 `@ : / # ? % 空格`。留空自动生成 16 位随机串。
+
+唯一的外部限制来自系统：dante 的用户名认证走 PAM，**用户名必须对应一个真实的 Linux 账号**。`useradd` 默认会拒掉大写开头、数字开头的名字，脚本会自动加 `--badname` 重试；如果系统仍然拒绝，会打印 `useradd` 的原始报错。
+
+密码写入时如果被 `pam_pwquality` 之类按复杂度挡下，脚本会绕开 PAM 直接写 SHA-512 哈希，所以 `123` 这种密码也能设成功。
+
+因为密码可能有特殊字符，客户端命令一律用 `--proxy-user` 传凭据，不走 `user:pass@host` 的 URL 形式：
+
+```bash
+curl --socks5-hostname 服务器IP:1080 --proxy-user '用户名:密码' https://api.ipify.org
+```
+
 ## 客户端
 
 浏览器填 SOCKS5 主机 + 端口，**务必勾选「代理解析域名」/「远程 DNS」**，否则 DNS 泄漏。
@@ -87,7 +104,7 @@ socks5 uninstall
 curl 验证：
 
 ```bash
-curl --socks5-hostname 用户名:密码@服务器IP:1080 https://api.ipify.org
+curl --socks5-hostname 服务器IP:1080 --proxy-user '用户名:密码' https://api.ipify.org
 ```
 
 返回服务器的出口 IP 即成功。
